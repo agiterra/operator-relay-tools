@@ -1,19 +1,21 @@
 {
   "name": "@agiterra/operator-relay-tools",
-  "version": "0.1.0",
-  "description": "Operator-prompt relay — forwards operator prompts to managing agents via Wire IPC.",
-  "type": "module",
+  "version": "0.2.0",
+  "author": "Tim Garthwaite <https://github.com/mividtim>",
   "main": "./src/index.ts",
-  "exports": {
-    ".": "./src/index.ts"
-  },
-  "files": [
-    "src/"
-  ],
-  "dependencies": {},
   "devDependencies": {
     "bun-types": "latest"
   },
+  "exports": {
+    ".": "./src/index.ts"
+  },
+  "description": "Operator-prompt relay \u2014 forwards operator prompts to managing agents via Wire IPC.",
+  "files": [
+    "src/"
+  ],
   "license": "MIT",
-  "author": "Tim Garthwaite <https://github.com/mividtim>"
+  "type": "module",
+  "dependencies": {
+    "@agiterra/wire-tools": "file:../wire-tools"
+  }
 }

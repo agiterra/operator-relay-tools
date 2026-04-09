@@ -6,11 +6,12 @@
  * told its ephemerals.
  *
  * State is a simple JSON file at ~/.wire/operator-relay.json:
- * { "agentId": { "notify": "brioche", "privateKeyB64": "..." } }
+ * { "agentId": { "notify": "brioche" } }
  */
 
 import { join } from "path";
 import { readFileSync, writeFileSync, existsSync, mkdirSync } from "fs";
+import { sendSignedMessage } from "@agiterra/wire-tools";
 
 const STATE_FILE = join(process.env.HOME ?? "/tmp", ".wire", "operator-relay.json");
 
@@ -64,10 +65,11 @@ export function listRelays(): RelayState {
 
 /**
  * Forward an operator prompt to the managing agent.
- * Uses the Wire gateway to deliver via IPC.
+ * Sends a JWT-signed message via the Wire operator-relay plugin channel.
  */
 export async function forwardPrompt(opts: {
   agentId: string;
+  privateKey: CryptoKey;
   notify: string;
   prompt: string;
   wireUrl?: string;
@@ -81,19 +83,12 @@ export async function forwardPrompt(opts: {
     timestamp: new Date().toISOString(),
   };
 
-  // Send unsigned (relay is infrastructure, not agent-to-agent conversation)
-  const response = await fetch(`${wireUrl}/publish`, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify({
-      source: opts.agentId,
-      topic: "operator-relay",
-      dest: opts.notify,
-      payload,
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`relay failed: ${response.status} ${await response.text()}`);
-  }
+  await sendSignedMessage(
+    wireUrl,
+    opts.agentId,
+    opts.privateKey,
+    "operator-relay",
+    payload,
+    opts.notify,
+  );
 }
