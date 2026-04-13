@@ -40,6 +40,9 @@ function saveState(state: RelayState): void {
 
 /** Register an agent for operator-prompt relay. */
 export function startRelay(agentId: string, notify: string): void {
+  if (agentId === notify) {
+    throw new Error(`cannot relay '${agentId}' to itself — this creates an infinite loop`);
+  }
   const state = loadState();
   state[agentId] = { notify };
   saveState(state);
