@@ -1,6 +1,6 @@
 {
   "name": "@agiterra/operator-relay-tools",
-  "version": "1.0.1",
+  "version": "1.1.0",
   "author": "Tim Garthwaite <https://github.com/mividtim>",
   "main": "./src/index.ts",
   "devDependencies": {
@@ -16,7 +16,7 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
-    "@agiterra/wire-tools": "agiterra/wire-tools#v1.0.0",
+    "@agiterra/wire-tools": "agiterra/wire-tools#v2.0.0",
     "@modelcontextprotocol/sdk": "^1.29.0"
   }
 }
