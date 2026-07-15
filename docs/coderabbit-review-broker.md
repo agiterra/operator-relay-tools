@@ -120,7 +120,8 @@ For either arbitrary-comment capability, the corresponding flow additionally:
    Unicode, Markdown, mentions, and URLs otherwise remain byte-for-byte exact.
 3. Uses one SQLite `BEGIN IMMEDIATE` transaction to bind caller + capability +
    client idempotency key to one payload hash, serialize same-target ambiguous
-   work, enforce a capability-specific rate scope, and reserve `processing`.
+   work across every authorized caller, enforce a target-wide
+   capability-specific rate scope, and reserve `processing`.
    A key reused for a different payload fails closed. `processing` and
    `unsafe_posted` require operator reconciliation; only a pre-POST `failed`
    request with the same payload can retry.
@@ -156,8 +157,8 @@ The broker requires:
 | `CODERABBIT_BROKER_ALLOWED_CALLERS_JSON` | JSON map of caller IDs to current Wire public-key arrays |
 | `GITHUB_COMMENT_BROKER_ALLOWED_CALLERS_JSON` | Separate maps keyed by `github.pr_comment` and `github.review_thread_reply`; defaults to `{}` (no grants) |
 | `GITHUB_COMMENT_BROKER_AUDIT_TEXT_POLICY` | `hash` (default) or `redacted_full`; see audit policy below |
-| `GITHUB_COMMENT_BROKER_PR_COMMENT_MINIMUM_INTERVAL_MS` | Per-caller/PR PR-comment interval; default 60 minutes |
-| `GITHUB_COMMENT_BROKER_REVIEW_REPLY_MINIMUM_INTERVAL_MS` | Per-caller/PR/root-anchor reply interval; default 30 minutes |
+| `GITHUB_COMMENT_BROKER_PR_COMMENT_MINIMUM_INTERVAL_MS` | Target-wide per-PR comment interval across all callers; default 60 minutes |
+| `GITHUB_COMMENT_BROKER_REVIEW_REPLY_MINIMUM_INTERVAL_MS` | Target-wide per-PR/root-anchor reply interval across all callers; default 30 minutes |
 | `CODERABBIT_BROKER_TOKEN_SOURCE` | Required explicit `github_app_user` or `fine_grained_pat` selection |
 | `CODERABBIT_BROKER_GITHUB_APP_CLIENT_ID` | Non-secret App client ID for the preferred source |
 | `CODERABBIT_BROKER_GITHUB_APP_CLIENT_SECRET_FILE` | Owner-only App client-secret file |

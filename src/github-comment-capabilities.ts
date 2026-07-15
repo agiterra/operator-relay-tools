@@ -368,8 +368,9 @@ export class GithubCommentCapabilitiesBroker {
         comment_url TEXT,
         error TEXT
       );
-      CREATE INDEX IF NOT EXISTS idx_github_comment_rate
-      ON github_comment_requests(capability, caller, rate_scope, posted_at);
+      DROP INDEX IF EXISTS idx_github_comment_rate;
+      CREATE INDEX IF NOT EXISTS idx_github_comment_target_rate
+      ON github_comment_requests(capability, rate_scope, posted_at);
     `);
   }
 
@@ -512,21 +513,21 @@ export class GithubCommentCapabilitiesBroker {
       }
 
       const ambiguous = this.db
-        .query<{ status: string }, [string, string, string]>(
+        .query<{ status: string }, [string, string]>(
           `SELECT status FROM github_comment_requests
-           WHERE capability = ? AND caller = ? AND rate_scope = ?
+           WHERE capability = ? AND rate_scope = ?
              AND status IN ('processing', 'unsafe_posted')
            LIMIT 1`,
         )
-        .get(capability, caller, scope);
+        .get(capability, scope);
       if (ambiguous) throw new Error("comment target has an in-progress or ambiguous request");
 
       const latest = this.db
-        .query<{ posted_at: number | null }, [string, string, string]>(
+        .query<{ posted_at: number | null }, [string, string]>(
           `SELECT MAX(posted_at) AS posted_at FROM github_comment_requests
-           WHERE capability = ? AND caller = ? AND rate_scope = ? AND status = 'posted'`,
+           WHERE capability = ? AND rate_scope = ? AND status = 'posted'`,
         )
-        .get(capability, caller, scope)?.posted_at ?? null;
+        .get(capability, scope)?.posted_at ?? null;
       if (latest !== null && now - latest < this.minimumInterval(capability)) {
         throw new Error("comment capability is rate-limited for this caller and target");
       }

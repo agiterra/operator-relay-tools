@@ -20,6 +20,7 @@ const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
 const REPO = "fabrica-land/soil-app";
 const CALLER = { source: "brioche", sourcePubkey: "verified-public-key-0001" };
+const SECOND_CALLER = { source: "vacherin", sourcePubkey: "verified-public-key-0002" };
 const ANCHOR_ID = 7001;
 const PR_COMMENT_ID = 9001;
 const REPLY_ID = 9002;
@@ -147,11 +148,17 @@ function grants(options: { pr?: boolean; reply?: boolean } = { pr: true, reply: 
   return new Map([
     [
       PR_COMMENT_METHOD,
-      new Map(options.pr ? [[CALLER.source, new Set([CALLER.sourcePubkey])]] : []),
+      new Map(options.pr ? [
+        [CALLER.source, new Set([CALLER.sourcePubkey])],
+        [SECOND_CALLER.source, new Set([SECOND_CALLER.sourcePubkey])],
+      ] : []),
     ],
     [
       REVIEW_THREAD_REPLY_METHOD,
-      new Map(options.reply ? [[CALLER.source, new Set([CALLER.sourcePubkey])]] : []),
+      new Map(options.reply ? [
+        [CALLER.source, new Set([CALLER.sourcePubkey])],
+        [SECOND_CALLER.source, new Set([SECOND_CALLER.sourcePubkey])],
+      ] : []),
     ],
   ]);
 }
@@ -419,6 +426,77 @@ describe("GithubCommentCapabilitiesBroker", () => {
     expect(reply.posted).toBe(true);
     expect(setup.fake.posts()).toHaveLength(2);
     setup.broker.close();
+  });
+
+  test("serializes each comment target and rate-limits it across authorized callers", async () => {
+    const cases = [
+      {
+        capability: PR_COMMENT_METHOD,
+        first: prRequest({ dry_run: false }),
+        second: prRequest({
+          dry_run: false,
+          client_idempotency_key: "second-caller-pr-0001",
+        }),
+      },
+      {
+        capability: REVIEW_THREAD_REPLY_METHOD,
+        first: replyRequest({ dry_run: false }),
+        second: replyRequest({
+          dry_run: false,
+          client_idempotency_key: "second-caller-reply-0001",
+        }),
+      },
+    ] as const;
+    for (const testCase of cases) {
+      const setup = makeBroker();
+      const results = await Promise.allSettled([
+        setup.broker.request(testCase.capability, testCase.first, CALLER),
+        setup.broker.request(testCase.capability, testCase.second, SECOND_CALLER),
+      ]);
+      expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+      expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+      expect(setup.fake.posts()).toHaveLength(1);
+      await expect(
+        setup.broker.request(testCase.capability, testCase.second, SECOND_CALLER),
+      ).rejects.toThrow(/rate-limited/);
+      setup.broker.close();
+      rmSync(dir, { recursive: true, force: true });
+      dir = mkdtempSync(join(tmpdir(), "github-comment-capabilities-"));
+    }
+  });
+
+  test("an ambiguous target blocks every other authorized caller", async () => {
+    const cases = [
+      {
+        capability: PR_COMMENT_METHOD,
+        first: prRequest({ dry_run: false }),
+        second: prRequest({
+          dry_run: false,
+          client_idempotency_key: "second-ambiguous-pr-0001",
+        }),
+      },
+      {
+        capability: REVIEW_THREAD_REPLY_METHOD,
+        first: replyRequest({ dry_run: false }),
+        second: replyRequest({
+          dry_run: false,
+          client_idempotency_key: "second-ambiguous-reply-0001",
+        }),
+      },
+    ] as const;
+    for (const testCase of cases) {
+      const setup = makeBroker(fakeGithub({ postThrows: true }));
+      await expect(
+        setup.broker.request(testCase.capability, testCase.first, CALLER),
+      ).rejects.toThrow(/ambiguous/);
+      await expect(
+        setup.broker.request(testCase.capability, testCase.second, SECOND_CALLER),
+      ).rejects.toThrow(/ambiguous/);
+      expect(setup.fake.posts()).toHaveLength(1);
+      setup.broker.close();
+      rmSync(dir, { recursive: true, force: true });
+      dir = mkdtempSync(join(tmpdir(), "github-comment-capabilities-"));
+    }
   });
 
   test("marks an ambiguous POST fail-closed and never retries it", async () => {
