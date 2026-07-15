@@ -1,0 +1,59 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.agiterra.coderabbit-review-broker</string>
+
+  <!-- Deliberately disabled in source. Enable only after security review and Tim release. -->
+  <key>RunAtLoad</key>
+  <false/>
+  <key>KeepAlive</key>
+  <false/>
+
+  <key>ProgramArguments</key>
+  <array>
+    <string>/opt/homebrew/bin/bun</string>
+    <string>run</string>
+    <string>/OWNER_ONLY/operator-relay-tools/src/coderabbit-review-broker-server.ts</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/OWNER_ONLY/operator-relay-tools</string>
+
+  <key>EnvironmentVariables</key>
+  <dict>
+    <key>AGENT_ID</key>
+    <string>github-review-broker@HOSTNAME</string>
+    <key>WIRE_URL</key>
+    <string>http://127.0.0.1:9800</string>
+    <key>CODERABBIT_BROKER_ALLOWED_REPOS</key>
+    <string>fabrica-land/fabrica-v3-api,fabrica-land/soil-app</string>
+    <key>CODERABBIT_BROKER_ALLOWED_CALLERS_JSON</key>
+    <string>{}</string>
+    <!-- Higher-privilege methods stay independently disabled until explicit enrollment. -->
+    <key>GITHUB_COMMENT_BROKER_ALLOWED_CALLERS_JSON</key>
+    <string>{}</string>
+    <key>GITHUB_COMMENT_BROKER_AUDIT_TEXT_POLICY</key>
+    <string>hash</string>
+    <key>CODERABBIT_BROKER_TOKEN_SOURCE</key>
+    <string>github_app_user</string>
+    <key>CODERABBIT_BROKER_GITHUB_APP_CLIENT_ID</key>
+    <string>UNREGISTERED_DISABLED_APP</string>
+    <key>CODERABBIT_BROKER_GITHUB_APP_CLIENT_SECRET_FILE</key>
+    <string>/OWNER_ONLY/coderabbit-review/github-app-client-secret</string>
+    <key>CODERABBIT_BROKER_GITHUB_APP_USER_TOKEN_STATE_FILE</key>
+    <string>/OWNER_ONLY/coderabbit-review/github-app-user-token.json</string>
+    <key>CODERABBIT_BROKER_STATE_FILE</key>
+    <string>/OWNER_ONLY/coderabbit-review/requests.sqlite</string>
+    <key>CODERABBIT_BROKER_AUDIT_FILE</key>
+    <string>/OWNER_ONLY/coderabbit-review/audit.jsonl</string>
+  </dict>
+
+  <!-- AGENT_PRIVATE_KEY must be injected by an owner-only wrapper/keychain at install time. -->
+  <key>StandardOutPath</key>
+  <string>/OWNER_ONLY/coderabbit-review/stdout.log</string>
+  <key>StandardErrorPath</key>
+  <string>/OWNER_ONLY/coderabbit-review/stderr.log</string>
+</dict>
+</plist>
