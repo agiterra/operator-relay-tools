@@ -3,8 +3,13 @@
   "version": "1.1.0",
   "author": "Tim Garthwaite <https://github.com/mividtim>",
   "main": "./src/index.ts",
-  "devDependencies": {
-    "bun-types": "latest"
+  "scripts": {
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
+  },
+  "bin": {
+    "coderabbit-review-broker": "./src/coderabbit-review-broker-server.ts",
+    "coderabbit-review-mcp": "./src/coderabbit-review-mcp.ts"
   },
   "exports": {
     ".": "./src/index.ts"
@@ -16,7 +21,11 @@
   "license": "MIT",
   "type": "module",
   "dependencies": {
-    "@agiterra/wire-tools": "agiterra/wire-tools#v2.0.0",
+    "@agiterra/wire-tools": "agiterra/wire-tools#v2.17.1",
     "@modelcontextprotocol/sdk": "^1.29.0"
+  },
+  "devDependencies": {
+    "bun-types": "latest",
+    "typescript": "5.7.3"
   }
 }

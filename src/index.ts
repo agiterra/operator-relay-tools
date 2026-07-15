@@ -9,3 +9,16 @@ export {
 
 // MCP server (shared by claude-code and codex adapters)
 export { startServer } from "./mcp-server.js";
+
+export {
+  CODERABBIT_FULL_REVIEW_COMMENT,
+  CODERABBIT_REVIEW_METHOD,
+  EXPECTED_GITHUB_LOGIN,
+  CoderabbitReviewBroker,
+  parseAllowedCallers,
+  parseAllowedRepos,
+  type CoderabbitReviewRequest,
+  type ReviewBrokerConfig,
+  type ReviewBrokerResult,
+  type VerifiedCaller,
+} from "./coderabbit-review.js";
