@@ -7,6 +7,7 @@ import {
   CoderabbitReviewBroker,
   type CoderabbitReviewRequest,
 } from "./coderabbit-review.js";
+import { FineGrainedPatFileTokenSource } from "./github-token-source.js";
 
 const HEAD_A = "a".repeat(40);
 const HEAD_B = "b".repeat(40);
@@ -96,7 +97,7 @@ function request(overrides: Partial<CoderabbitReviewRequest> = {}): CoderabbitRe
   };
 }
 
-function makeBroker(fake = fakeGithub(), token = "owner-secret-token", minimumIntervalMs = 60_000) {
+function makeBroker(fake = fakeGithub(), token = "github_pat_owner-secret-token", minimumIntervalMs = 60_000) {
   const tokenFile = join(dir, "github-token");
   const stateFile = join(dir, "state", "requests.sqlite");
   const auditFile = join(dir, "audit", "requests.jsonl");
@@ -109,7 +110,7 @@ function makeBroker(fake = fakeGithub(), token = "owner-secret-token", minimumIn
       ["brioche", new Set([CALLER.sourcePubkey])],
       ["vacherin", new Set(["vacherin-public-key-0001"])],
     ]),
-    tokenFile,
+    tokenSource: new FineGrainedPatFileTokenSource(tokenFile),
     stateFile,
     auditFile,
     minimumIntervalMs,
@@ -239,7 +240,7 @@ describe("CoderabbitReviewBroker", () => {
   test("rejects group/world-readable credential files", async () => {
     const setup = makeBroker();
     chmodSync(setup.tokenFile, 0o644);
-    await expect(setup.broker.request(request(), CALLER)).rejects.toThrow(/owner-only/);
+    await expect(setup.broker.request(request(), CALLER)).rejects.toThrow(/owner-only|private/);
     expect(setup.fake.calls).toHaveLength(0);
     setup.broker.close();
   });
@@ -247,12 +248,12 @@ describe("CoderabbitReviewBroker", () => {
   test("reads the token file per request so atomic rotation needs no agent change", async () => {
     const setup = makeBroker();
     await setup.broker.request(request(), CALLER);
-    writeFileSync(setup.tokenFile, "rotated-owner-token\n", { mode: 0o600 });
+    writeFileSync(setup.tokenFile, "github_pat_rotated-owner-token\n", { mode: 0o600 });
     chmodSync(setup.tokenFile, 0o600);
     await setup.broker.request(request(), CALLER);
     const userCalls = setup.fake.calls.filter((call) => call.url.endsWith("/user"));
-    expect(userCalls[0]!.auth).toBe("Bearer owner-secret-token");
-    expect(userCalls[1]!.auth).toBe("Bearer rotated-owner-token");
+    expect(userCalls[0]!.auth).toBe("Bearer github_pat_owner-secret-token");
+    expect(userCalls[1]!.auth).toBe("Bearer github_pat_rotated-owner-token");
     setup.broker.close();
   });
 
@@ -320,7 +321,7 @@ describe("CoderabbitReviewBroker", () => {
     expect(statSync(`${setup.stateFile}-wal`).mode & 0o077).toBe(0);
     expect(statSync(`${setup.stateFile}-shm`).mode & 0o077).toBe(0);
     const audit = readFileSync(setup.auditFile, "utf8");
-    expect(audit).not.toContain("owner-secret-token");
+    expect(audit).not.toContain("github_pat_owner-secret-token");
     expect(audit).toContain('"outcome":"dry_run"');
     setup.broker.close();
   });

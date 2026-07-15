@@ -9,7 +9,8 @@
   },
   "bin": {
     "coderabbit-review-broker": "./src/coderabbit-review-broker-server.ts",
-    "coderabbit-review-mcp": "./src/coderabbit-review-mcp.ts"
+    "coderabbit-review-mcp": "./src/coderabbit-review-mcp.ts",
+    "coderabbit-review-token-admin": "./src/coderabbit-review-token-admin.ts"
   },
   "exports": {
     ".": "./src/index.ts"

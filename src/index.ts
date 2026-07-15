@@ -22,3 +22,11 @@ export {
   type ReviewBrokerResult,
   type VerifiedCaller,
 } from "./coderabbit-review.js";
+
+export {
+  FineGrainedPatFileTokenSource,
+  GithubAppUserTokenSource,
+  githubTokenSourceFromEnv,
+  type GithubAppUserTokenSourceConfig,
+  type GithubTokenSource,
+} from "./github-token-source.js";

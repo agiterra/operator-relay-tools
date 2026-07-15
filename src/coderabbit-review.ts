@@ -8,10 +8,9 @@ import {
   lstatSync,
   mkdirSync,
   openSync,
-  readFileSync,
-  statSync,
 } from "node:fs";
 import { dirname } from "node:path";
+import type { GithubTokenSource } from "./github-token-source.js";
 
 export const CODERABBIT_FULL_REVIEW_COMMENT = "@coderabbitai full review";
 export const CODERABBIT_REVIEW_METHOD = "github.coderabbit_full_review";
@@ -61,7 +60,7 @@ type Fetch = typeof globalThis.fetch;
 export type ReviewBrokerConfig = {
   allowedRepos: ReadonlySet<string>;
   allowedCallers: ReadonlyMap<string, ReadonlySet<string>>;
-  tokenFile: string;
+  tokenSource: GithubTokenSource;
   stateFile: string;
   auditFile: string;
   minimumIntervalMs?: number;
@@ -117,16 +116,6 @@ function createPrivateFile(path: string): void {
   const fd = openSync(path, "a", 0o600);
   closeSync(fd);
   chmodSync(path, 0o600);
-}
-
-function readBrokerToken(path: string): string {
-  ensurePrivateParent(path);
-  assertOwnerOnlyFile(path, "GitHub credential file");
-  const st = statSync(path);
-  if (st.size < 1 || st.size > 8192) throw new Error("GitHub credential file has an invalid size");
-  const token = readFileSync(path, "utf8").trim();
-  if (!token || /\s/.test(token)) throw new Error("GitHub credential file is empty or malformed");
-  return token;
 }
 
 function parseRequest(input: unknown): CoderabbitReviewRequest {
@@ -413,7 +402,7 @@ export class CoderabbitReviewBroker {
         throw new Error("review request is rate-limited for this PR");
       }
 
-      const token = readBrokerToken(this.config.tokenFile);
+      const token = await this.config.tokenSource.getToken();
       await this.validateIdentityAndPr(token, req);
 
       if (req.dry_run) {

@@ -19,6 +19,7 @@ import {
   parseAllowedCallers,
   parseAllowedRepos,
 } from "./coderabbit-review.js";
+import { githubTokenSourceFromEnv } from "./github-token-source.js";
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
@@ -38,7 +39,7 @@ async function main(): Promise<void> {
   const broker = new CoderabbitReviewBroker({
     allowedRepos: parseAllowedRepos(required("CODERABBIT_BROKER_ALLOWED_REPOS")),
     allowedCallers: parseAllowedCallers(required("CODERABBIT_BROKER_ALLOWED_CALLERS_JSON")),
-    tokenFile: required("CODERABBIT_BROKER_TOKEN_FILE"),
+    tokenSource: githubTokenSourceFromEnv(),
     stateFile: required("CODERABBIT_BROKER_STATE_FILE"),
     auditFile: required("CODERABBIT_BROKER_AUDIT_FILE"),
     minimumIntervalMs: Number(process.env.CODERABBIT_BROKER_MINIMUM_INTERVAL_MS ?? 30 * 60_000),

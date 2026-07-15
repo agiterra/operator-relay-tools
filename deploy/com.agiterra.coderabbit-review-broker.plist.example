@@ -31,8 +31,14 @@
     <string>fabrica-land/fabrica-v3-api,fabrica-land/soil-app</string>
     <key>CODERABBIT_BROKER_ALLOWED_CALLERS_JSON</key>
     <string>{}</string>
-    <key>CODERABBIT_BROKER_TOKEN_FILE</key>
-    <string>/OWNER_ONLY/coderabbit-review/github-user-token</string>
+    <key>CODERABBIT_BROKER_TOKEN_SOURCE</key>
+    <string>github_app_user</string>
+    <key>CODERABBIT_BROKER_GITHUB_APP_CLIENT_ID</key>
+    <string>UNREGISTERED_DISABLED_APP</string>
+    <key>CODERABBIT_BROKER_GITHUB_APP_CLIENT_SECRET_FILE</key>
+    <string>/OWNER_ONLY/coderabbit-review/github-app-client-secret</string>
+    <key>CODERABBIT_BROKER_GITHUB_APP_USER_TOKEN_STATE_FILE</key>
+    <string>/OWNER_ONLY/coderabbit-review/github-app-user-token.json</string>
     <key>CODERABBIT_BROKER_STATE_FILE</key>
     <string>/OWNER_ONLY/coderabbit-review/requests.sqlite</string>
     <key>CODERABBIT_BROKER_AUDIT_FILE</key>
