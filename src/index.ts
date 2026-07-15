@@ -30,3 +30,19 @@ export {
   type GithubAppUserTokenSourceConfig,
   type GithubTokenSource,
 } from "./github-token-source.js";
+
+export {
+  COMMENT_CAPABILITIES,
+  PR_COMMENT_METHOD,
+  REVIEW_THREAD_REPLY_METHOD,
+  GithubCommentCapabilitiesBroker,
+  parseCapabilityCallers,
+  type AuditTextPolicy,
+  type CapabilityCallerMap,
+  type CommentAuditMetadata,
+  type CommentCapability,
+  type GithubCommentCapabilitiesConfig,
+  type GithubCommentCapabilityResult,
+  type PrCommentRequest,
+  type ReviewThreadReplyRequest,
+} from "./github-comment-capabilities.js";

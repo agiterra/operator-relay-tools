@@ -1,4 +1,4 @@
-# CodeRabbit full-review broker
+# Owner-isolated GitHub comment broker
 
 Status: **implemented but disabled**. Do not install, enroll, allowlist, or use
 this capability on a live pull request until independent security review and an
@@ -28,22 +28,37 @@ keeps both options inside the owner-only runtime:
 A per-agent `github-tools` MCP extension was rejected because that process
 model would delegate the credential to every caller.
 
-## Components
+## Components and independently granted capabilities
 
-- `coderabbit-review-mcp`: credential-free agent MCP client. It accepts only
-  `repo`, `pr_number`, `review_mode: "full"`, `expected_head_sha`, and
-  `dry_run`. It sends a signed Wire RPC request.
+- `coderabbit-review-mcp`: credential-free agent MCP client. It exposes the
+  fixed CodeRabbit request plus two higher-privilege tools. Listing a tool does
+  not grant it; the broker's capability-specific caller/public-key map does.
 - `coderabbit-review-broker`: dedicated permanent Wire server-plugin. It is the
   only process that can read the GitHub credential and call GitHub.
 - `CoderabbitReviewBroker`: pure/injectable policy and GitHub implementation,
   covered by adversarial tests.
 
-The broker RPC method is `github.coderabbit_full_review`. The only possible
-comment body is:
+The foundational RPC method is `github.coderabbit_full_review`. Its only
+possible comment body remains:
 
 ```text
 @coderabbitai full review
 ```
+
+Arbitrary text is not a relaxation of that method. It is implemented as two
+separate capabilities with independent enrollment and revocation:
+
+| RPC method | MCP tool | Target |
+| --- | --- | --- |
+| `github.pr_comment` | `github_pr_comment` | PR-level issue comment |
+| `github.review_thread_reply` | `github_review_thread_reply` | Reply to an exact root review-comment anchor |
+
+Both higher-privilege schemas require exact `repo`, `pr_number`,
+`expected_head_sha`, nonempty `text` (maximum 8192 UTF-8 bytes), explicit
+`dry_run`, a 16-128 character `client_idempotency_key`, bounded
+`justification`, and strict `audit_metadata` (`tracking_ref` plus a fixed
+`reason_code`). Review replies additionally require a positive
+`review_comment_id`.
 
 ## Trust boundary
 
@@ -55,21 +70,23 @@ broker requires both:
 - exact broker-verified Ed25519 public key from an owner-controlled map.
 
 Missing keys, federated frames, source spoofing, and caller/key mismatches fail
-closed. Adding Vacherin is a configuration change: its current public key must
-be added explicitly; naming the caller `vacherin` is insufficient.
+closed. Fixed-full-review, PR-comment, and review-thread-reply grants are
+separate maps. Adding Vacherin to one does not grant either of the others;
+naming the caller `vacherin` is insufficient.
 
 ## Threat model
 
 The broker assumes an allowed agent may be buggy or malicious, GitHub or the
 network may return an ambiguous result, and local non-owner processes may try
-to inspect or replace files. It therefore defends against arbitrary-comment
-injection, SSRF/repository spoofing, caller-ID spoofing, stale or stolen
-caller keys, credential/target/head drift, duplicate/rate-abusive requests,
-concurrent identical or distinct-head races, crash-after-reservation/POST
+to inspect or replace files. It therefore defends against schema/comment/path
+injection, SSRF/repository spoofing, wrong-PR or outdated review anchors,
+caller-ID spoofing, stale or stolen caller keys, credential/target/head drift,
+duplicate/rate-abusive requests, client-idempotency-key payload collisions,
+concurrent identical or same-target races, crash-after-reservation/POST
 retries, internal Authorization-header override, symlink/permission attacks,
-and leakage through agent configuration, argv, logs, results, or audit.
-Compromise of the broker's own OS identity is outside this boundary and
-requires immediate revocation.
+likely credential/private-key content, and leakage through agent
+configuration, argv, logs, results, or audit. Compromise of the broker's own
+OS identity is outside this boundary and requires immediate revocation.
 
 ## Request flow
 
@@ -94,6 +111,30 @@ requires immediate revocation.
 10. Request/refusal/result metadata is appended to an owner-only audit file.
     Credentials and authorization headers are never recorded.
 
+For either arbitrary-comment capability, the corresponding flow additionally:
+
+1. Verifies the exact capability-specific caller ID and broker-stamped public
+   key. An empty map is the default and means no arbitrary-comment authority.
+2. Rejects unknown properties, control characters, likely credential/private
+   key material, invalid idempotency keys, and text over 8192 UTF-8 bytes.
+   Unicode, Markdown, mentions, and URLs otherwise remain byte-for-byte exact.
+3. Uses one SQLite `BEGIN IMMEDIATE` transaction to bind caller + capability +
+   client idempotency key to one payload hash, serialize same-target ambiguous
+   work, enforce a capability-specific rate scope, and reserve `processing`.
+   A key reused for a different payload fails closed. `processing` and
+   `unsafe_posted` require operator reconciliation; only a pre-POST `failed`
+   request with the same payload can retry.
+4. For thread replies, reads `pulls/comments/{review_comment_id}` and requires
+   the root anchor to belong to the exact allowlisted repo/PR, have the exact
+   expected head commit, and retain a live positive diff position. Replies,
+   deleted comments, wrong-PR/repo anchors, and outdated anchors are rejected.
+5. Constructs only fixed `api.github.com` paths. PR comments use the issue
+   comments endpoint; review replies use the exact
+   `pulls/{pr}/comments/{root_id}/replies` endpoint.
+6. After POST, re-reads the comment, operator author, exact body, open PR/head,
+   and (for replies) the exact root anchor. Any transport or TOCTOU ambiguity is
+   durably `unsafe_posted` and cannot auto-retry.
+
 Once a POST is attempted, any transport ambiguity, process interruption,
 readback failure, or post-time head validation failure is treated as
 `unsafe_posted`; automatic retry is blocked to prevent a duplicate command.
@@ -113,6 +154,10 @@ The broker requires:
 | `WIRE_URL` | Local Wire broker URL |
 | `CODERABBIT_BROKER_ALLOWED_REPOS` | Comma-separated exact repository names |
 | `CODERABBIT_BROKER_ALLOWED_CALLERS_JSON` | JSON map of caller IDs to current Wire public-key arrays |
+| `GITHUB_COMMENT_BROKER_ALLOWED_CALLERS_JSON` | Separate maps keyed by `github.pr_comment` and `github.review_thread_reply`; defaults to `{}` (no grants) |
+| `GITHUB_COMMENT_BROKER_AUDIT_TEXT_POLICY` | `hash` (default) or `redacted_full`; see audit policy below |
+| `GITHUB_COMMENT_BROKER_PR_COMMENT_MINIMUM_INTERVAL_MS` | Per-caller/PR PR-comment interval; default 60 minutes |
+| `GITHUB_COMMENT_BROKER_REVIEW_REPLY_MINIMUM_INTERVAL_MS` | Per-caller/PR/root-anchor reply interval; default 30 minutes |
 | `CODERABBIT_BROKER_TOKEN_SOURCE` | Required explicit `github_app_user` or `fine_grained_pat` selection |
 | `CODERABBIT_BROKER_GITHUB_APP_CLIENT_ID` | Non-secret App client ID for the preferred source |
 | `CODERABBIT_BROKER_GITHUB_APP_CLIENT_SECRET_FILE` | Owner-only App client-secret file |
@@ -125,6 +170,23 @@ The broker requires:
 
 The agent MCP receives only its normal Wire identity plus
 `CODERABBIT_REVIEW_BROKER_AGENT_ID`. It receives no GitHub credential.
+
+## Audit and secret policy
+
+The owner-only JSONL audit always records the capability, verified caller ID,
+target metadata, tracking reference, reason code, text byte count and SHA-256,
+plus hashes of justification and client idempotency key. The default `hash`
+policy never records arbitrary comment text. `redacted_full` is an explicit
+owner configuration for local incident needs; it redacts recognized GitHub,
+OpenAI-style, and private-key material and omits oversized text. The request is
+also rejected before GitHub if the comment body resembles credential or
+private-key material. Neither policy records GitHub authorization headers,
+tokens, caller public keys, process environment, or token-source responses.
+
+Linear is not a webhook source for this broker. AGI-24 status and every release
+or reconciliation decision must come from a fresh authenticated Linear
+GraphQL/API poll. Webhook silence is never evidence and no Linear webhook is
+installed or assumed by this design.
 
 ## Provisioning and release sequence
 
@@ -140,8 +202,10 @@ The agent MCP receives only its normal Wire identity plus
 4. Create a dedicated broker runtime directory with mode `0700`.
 5. Write credential/state/audit files as the broker owner with mode `0600`.
 6. Enroll the dedicated broker identity and declare it as a Wire server plugin.
-7. Configure exact repositories and caller ID/public-key pairs. Keep Vacherin
-   absent unless explicitly approved.
+7. Configure exact repositories and fixed-full-review caller ID/public-key
+   pairs. Keep both higher-privilege capability maps empty. If later approved,
+   enroll a caller separately in only the exact capability it needs; keep
+   Vacherin absent unless explicitly approved for that capability.
 8. Install the launchd unit only after review. Start with no allowed callers.
 9. Run broker integration tests against a disposable private test repository,
    first dry-run and then one explicitly approved comment.
@@ -169,7 +233,9 @@ non-starting (`RunAtLoad=false`, `KeepAlive=false`) and contains no credential.
   `204` result. It is not registered as an MCP tool.
 - **Rotate PAT fallback:** write a new owner-only file, `chmod 0600`, then
   atomically rename over the configured token path.
-- **Revoke caller:** remove its ID/public-key entry and restart the broker.
+- **Revoke caller:** remove its ID/public-key entry from the exact capability
+  map and restart the broker. Revoking arbitrary PR comments does not alter the
+  fixed-full-review or review-thread-reply grants, and vice versa.
 - **Emergency stop:** unload launchd, revoke the GitHub token, and remove the
   broker from Wire's server-plugin list.
 - **Rotate broker Wire key:** stop the service, rotate the enrolled permanent
@@ -190,13 +256,16 @@ non-starting (`RunAtLoad=false`, `KeepAlive=false`) and contains no credential.
 
 ## Validation
 
-`bun test` covers unauthorized/unverified callers, arbitrary properties,
-comment injection, SSRF and repository spoofing, closed/head-drifted PRs,
-credential identity/permission/rotation, GitHub App refresh/expiry/error paths,
-owner-only App-grant revocation, dry-run, duplicate requests, rate limits,
-concurrent identical/distinct-head races, crash recovery, immutable
-Authorization construction, ambiguous transport, readback identity mismatch,
-post-time drift, and secret-free audit.
+`bun test` covers unauthorized/unverified and capability-mismatched callers,
+arbitrary properties, Unicode/Markdown/mentions/URLs, size and secret-content
+limits, SSRF and repository spoofing, wrong-PR/repo/deleted/outdated thread
+anchors, exact reply endpoint construction, closed/head-drifted PRs, credential
+identity/permission/rotation, GitHub App refresh/expiry/error paths, owner-only
+App-grant revocation, dry-run, idempotency-key collisions, duplicate requests,
+per-capability rate limits, concurrent identical/same-target races, crash
+recovery, immutable Authorization construction, ambiguous transport, readback
+author/body/anchor mismatch, post-time TOCTOU drift, and hash/redaction audit
+policy.
 
 GitHub references: [refreshing user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens)
 and [deleting an app authorization](https://docs.github.com/en/rest/apps/oauth-applications#delete-an-app-authorization).

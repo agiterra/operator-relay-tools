@@ -31,6 +31,11 @@
     <string>fabrica-land/fabrica-v3-api,fabrica-land/soil-app</string>
     <key>CODERABBIT_BROKER_ALLOWED_CALLERS_JSON</key>
     <string>{}</string>
+    <!-- Higher-privilege methods stay independently disabled until explicit enrollment. -->
+    <key>GITHUB_COMMENT_BROKER_ALLOWED_CALLERS_JSON</key>
+    <string>{}</string>
+    <key>GITHUB_COMMENT_BROKER_AUDIT_TEXT_POLICY</key>
+    <string>hash</string>
     <key>CODERABBIT_BROKER_TOKEN_SOURCE</key>
     <string>github_app_user</string>
     <key>CODERABBIT_BROKER_GITHUB_APP_CLIENT_ID</key>
