@@ -1,4 +1,6 @@
 import { afterEach, beforeEach, describe, expect, test } from "bun:test";
+import { Database } from "bun:sqlite";
+import { createHash } from "node:crypto";
 import { chmodSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -157,6 +159,45 @@ describe("CoderabbitReviewBroker", () => {
     broker.close();
   });
 
+  test("serializes concurrent identical requests into one post", async () => {
+    const { broker, fake } = makeBroker();
+    const results = await Promise.allSettled([
+      broker.request(request({ dry_run: false }), CALLER),
+      broker.request(request({ dry_run: false }), CALLER),
+    ]);
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1);
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1);
+    const rejected = results.find((result) => result.status === "rejected") as PromiseRejectedResult;
+    expect(String(rejected.reason)).toMatch(/in progress|ambiguous/);
+    expect(fake.posts()).toHaveLength(1);
+    const duplicate = await broker.request(request({ dry_run: false }), CALLER);
+    expect(duplicate.idempotent).toBe(true);
+    expect(fake.posts()).toHaveLength(1);
+    broker.close();
+  });
+
+  test("serializes distinct-head races and enforces the same-PR rate limit", async () => {
+    const setup = makeBroker();
+    const results = await Promise.allSettled([
+      setup.broker.request(request({ dry_run: false }), CALLER),
+      setup.broker.request(
+        request({ expected_head_sha: HEAD_B, dry_run: false }),
+        CALLER,
+      ),
+    ]);
+    expect(results[0]!.status).toBe("fulfilled");
+    expect(results[1]!.status).toBe("rejected");
+    expect(String((results[1] as PromiseRejectedResult).reason)).toMatch(/in progress|ambiguous/);
+    expect(setup.fake.posts()).toHaveLength(1);
+
+    setup.fake.setHead(HEAD_B);
+    await expect(
+      setup.broker.request(request({ expected_head_sha: HEAD_B, dry_run: false }), CALLER),
+    ).rejects.toThrow(/rate-limited/);
+    expect(setup.fake.posts()).toHaveLength(1);
+    setup.broker.close();
+  });
+
   test("rejects missing broker-verified public key", async () => {
     const { broker, fake } = makeBroker();
     await expect(broker.request(request(), { source: "brioche" })).rejects.toThrow(/not authorized/);
@@ -184,6 +225,18 @@ describe("CoderabbitReviewBroker", () => {
     ).rejects.toThrow(/unexpected request property/);
     expect(fake.calls).toHaveLength(0);
     broker.close();
+  });
+
+  test("internal request initialization cannot override the broker Authorization header", async () => {
+    const setup = makeBroker();
+    const hidden = setup.broker as unknown as {
+      githubJson<T>(token: string, path: string, init?: RequestInit): Promise<T>;
+    };
+    await hidden.githubJson("github_pat_owner-secret-token", "/user", {
+      headers: { Authorization: "Bearer attacker-controlled" },
+    });
+    expect(setup.fake.calls[0]!.auth).toBe("Bearer github_pat_owner-secret-token");
+    setup.broker.close();
   });
 
   test("rejects SSRF, repo spoofing, traversal, Unicode, and injection targets", async () => {
@@ -311,6 +364,46 @@ describe("CoderabbitReviewBroker", () => {
     );
     expect(fake.posts()).toHaveLength(1);
     setup.broker.close();
+  });
+
+  test("crash recovery keeps persisted processing state fail-closed", async () => {
+    const setup = makeBroker();
+    setup.broker.close();
+    const key = createHash("sha256")
+      .update(`${REPO}\0${42}\0${HEAD_A}\0full`)
+      .digest("hex");
+    const db = new Database(setup.stateFile);
+    db.query(
+      `INSERT INTO review_requests
+       (request_key, repo, pr_number, head_sha, review_mode, caller, status, requested_at)
+       VALUES (?, ?, ?, ?, 'full', ?, 'processing', ?)`,
+    ).run(key, REPO, 42, HEAD_A, CALLER.source, 1_700_000_000_000);
+    db.close();
+
+    const recovered = new CoderabbitReviewBroker({
+      allowedRepos: new Set([REPO]),
+      allowedCallers: new Map([[CALLER.source, new Set([CALLER.sourcePubkey])]]),
+      tokenSource: new FineGrainedPatFileTokenSource(setup.tokenFile),
+      stateFile: setup.stateFile,
+      auditFile: setup.auditFile,
+      minimumIntervalMs: 60_000,
+      fetchImpl: setup.fake.fetchImpl,
+      now: () => 1_700_000_100_000,
+    });
+    await expect(recovered.request(request({ dry_run: false }), CALLER)).rejects.toThrow(
+      /ambiguous prior outcome|operator review/,
+    );
+    expect(setup.fake.calls).toHaveLength(0);
+    recovered.close();
+
+    const readback = new Database(setup.stateFile, { readonly: true });
+    const row = readback
+      .query<{ status: string }, [string]>(
+        "SELECT status FROM review_requests WHERE request_key = ?",
+      )
+      .get(key);
+    expect(row?.status).toBe("processing");
+    readback.close();
   });
 
   test("audit/state are owner-only and audit never contains the credential", async () => {

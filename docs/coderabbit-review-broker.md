@@ -65,9 +65,11 @@ network may return an ambiguous result, and local non-owner processes may try
 to inspect or replace files. It therefore defends against arbitrary-comment
 injection, SSRF/repository spoofing, caller-ID spoofing, stale or stolen
 caller keys, credential/target/head drift, duplicate/rate-abusive requests,
-crash-after-POST retries, symlink/permission attacks, and leakage through
-agent configuration, argv, logs, results, or audit. Compromise of the broker's
-own OS identity is outside this boundary and requires immediate revocation.
+concurrent identical or distinct-head races, crash-after-reservation/POST
+retries, internal Authorization-header override, symlink/permission attacks,
+and leakage through agent configuration, argv, logs, results, or audit.
+Compromise of the broker's own OS identity is outside this boundary and
+requires immediate revocation.
 
 ## Request flow
 
@@ -80,8 +82,11 @@ own OS identity is outside this boundary and requires immediate revocation.
 4. `GET /user` must resolve to `mividtim`.
 5. GitHub must return the exact repository and PR, the PR must be open, and its
    head must equal `expected_head_sha`.
-6. Durable SQLite idempotency (`repo + PR + head + mode`) and per-PR rate limit
-   are checked.
+6. One SQLite `BEGIN IMMEDIATE` transaction decides exact-head idempotency,
+   rejects any same-PR processing/ambiguous state, serializes the per-PR rate
+   limit across distinct heads, and reserves the request. `posted`,
+   `unsafe_posted`, and `processing` can never be downgraded by reservation or
+   completion updates.
 7. A dry run returns the validated target without writing.
 8. The PR and identity are re-read immediately before the fixed comment POST.
 9. The created comment is read back from a broker-constructed URL. Body and
@@ -94,6 +99,8 @@ readback failure, or post-time head validation failure is treated as
 `unsafe_posted`; automatic retry is blocked to prevent a duplicate command.
 Persisted `processing` state is also fail-closed across restarts. An operator
 must inspect GitHub and reconcile the state database before another attempt.
+All broker-owned HTTP headers are applied after internal request initialization,
+so Authorization cannot be overridden by a future caller/refactor.
 
 ## Configuration
 
@@ -187,8 +194,9 @@ non-starting (`RunAtLoad=false`, `KeepAlive=false`) and contains no credential.
 comment injection, SSRF and repository spoofing, closed/head-drifted PRs,
 credential identity/permission/rotation, GitHub App refresh/expiry/error paths,
 owner-only App-grant revocation, dry-run, duplicate requests, rate limits,
-ambiguous transport, readback identity mismatch, post-time drift, and
-secret-free audit.
+concurrent identical/distinct-head races, crash recovery, immutable
+Authorization construction, ambiguous transport, readback identity mismatch,
+post-time drift, and secret-free audit.
 
 GitHub references: [refreshing user access tokens](https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/refreshing-user-access-tokens)
 and [deleting an app authorization](https://docs.github.com/en/rest/apps/oauth-applications#delete-an-app-authorization).

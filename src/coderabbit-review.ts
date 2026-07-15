@@ -89,6 +89,10 @@ type StoredRequest = {
   requested_at: number;
 };
 
+type ReservationDecision =
+  | { kind: "reserved"; key: string }
+  | { kind: "idempotent"; key: string; previous: StoredRequest };
+
 function ensurePrivateParent(path: string): void {
   const parent = dirname(path);
   mkdirSync(parent, { recursive: true, mode: 0o700 });
@@ -256,16 +260,17 @@ export class CoderabbitReviewBroker {
 
   private async githubJson<T>(token: string, path: string, init: RequestInit = {}): Promise<T> {
     if (!path.startsWith("/")) throw new Error("internal GitHub path must be relative");
+    const headers = new Headers(init.headers);
+    // Security headers are set after caller-provided initialization so even an
+    // internal refactor cannot override broker identity or content negotiation.
+    headers.set("Authorization", `Bearer ${token}`);
+    headers.set("Accept", "application/vnd.github+json");
+    headers.set("Content-Type", "application/json");
+    headers.set("User-Agent", "agiterra-coderabbit-review-broker");
+    headers.set("X-GitHub-Api-Version", "2022-11-28");
     const response = await this.fetchImpl(`${GITHUB_API}${path}`, {
       ...init,
-      headers: {
-        Authorization: `Bearer ${token}`,
-        Accept: "application/vnd.github+json",
-        "Content-Type": "application/json",
-        "User-Agent": "agiterra-coderabbit-review-broker",
-        "X-GitHub-Api-Version": "2022-11-28",
-        ...(init.headers ?? {}),
-      },
+      headers,
       redirect: "error",
     });
     if (!response.ok) throw new Error(`GitHub API request failed (${response.status})`);
@@ -308,49 +313,92 @@ export class CoderabbitReviewBroker {
     return row?.posted_at ?? null;
   }
 
-  private reserve(key: string, req: CoderabbitReviewRequest, caller: string, now: number): void {
+  private decideAndReserve(
+    req: CoderabbitReviewRequest,
+    caller: string,
+    now: number,
+  ): ReservationDecision {
+    const key = requestKey(req);
     const transaction = this.db.transaction(() => {
       const existing = this.stored(key);
-      if (existing?.status === "processing") {
+      if (existing?.status === "posted") {
+        return { kind: "idempotent", key, previous: existing } as const;
+      }
+      if (existing?.status === "unsafe_posted" || existing?.status === "processing") {
         throw new Error(
           "an identical review request is in progress or has an ambiguous prior outcome; operator review is required",
         );
       }
-      this.db
-        .query(
-          `INSERT INTO review_requests
-           (request_key, repo, pr_number, head_sha, review_mode, caller, status, requested_at)
-           VALUES (?, ?, ?, ?, ?, ?, 'processing', ?)
-           ON CONFLICT(request_key) DO UPDATE SET
-             caller = excluded.caller,
-             status = 'processing',
-             requested_at = excluded.requested_at,
-             error = NULL`,
+
+      const ambiguous = this.db
+        .query<{ status: string }, [string, number]>(
+          `SELECT status FROM review_requests
+           WHERE repo = ? AND pr_number = ? AND status IN ('processing', 'unsafe_posted')
+           LIMIT 1`,
         )
-        .run(key, req.repo, req.pr_number, req.expected_head_sha, req.review_mode, caller, now);
+        .get(req.repo, req.pr_number);
+      if (ambiguous) {
+        throw new Error(
+          "this PR has an in-progress or ambiguous prior request; operator review is required",
+        );
+      }
+
+      const postedAt = this.latestPostedAt(req.repo, req.pr_number);
+      if (postedAt !== null && now - postedAt < this.minimumIntervalMs) {
+        throw new Error("review request is rate-limited for this PR");
+      }
+
+      if (existing && existing.status !== "failed") {
+        throw new Error(`stored review request has unsupported state '${existing.status}'`);
+      }
+      if (existing) {
+        const update = this.db
+          .query(
+            `UPDATE review_requests SET
+               caller = ?, status = 'processing', requested_at = ?, posted_at = NULL,
+               comment_id = NULL, comment_url = NULL, error = NULL
+             WHERE request_key = ? AND status = 'failed'`,
+          )
+          .run(caller, now, key);
+        if (update.changes !== 1) throw new Error("failed request reservation lost an atomic race");
+      } else {
+        this.db
+          .query(
+            `INSERT INTO review_requests
+             (request_key, repo, pr_number, head_sha, review_mode, caller, status, requested_at)
+             VALUES (?, ?, ?, ?, ?, ?, 'processing', ?)`,
+          )
+          .run(key, req.repo, req.pr_number, req.expected_head_sha, req.review_mode, caller, now);
+      }
+      return { kind: "reserved", key } as const;
     });
-    transaction();
+    return transaction.immediate();
   }
 
   private markFailed(key: string, error: unknown): void {
-    this.db.query("UPDATE review_requests SET status = 'failed', error = ? WHERE request_key = ?")
+    this.db.query(
+      "UPDATE review_requests SET status = 'failed', error = ? WHERE request_key = ? AND status = 'processing'",
+    )
       .run(safeAuditError(error), key);
   }
 
   private markUnsafePosted(key: string, comment: GithubComment, error: unknown): void {
     this.db
       .query(
-        "UPDATE review_requests SET status = 'unsafe_posted', posted_at = ?, comment_id = ?, comment_url = ?, error = ? WHERE request_key = ?",
+        "UPDATE review_requests SET status = 'unsafe_posted', posted_at = ?, comment_id = ?, comment_url = ?, error = ? WHERE request_key = ? AND status = 'processing'",
       )
       .run(this.now(), comment.id ?? null, comment.html_url ?? null, safeAuditError(error), key);
   }
 
   private markPosted(key: string, comment: GithubComment): void {
-    this.db
+    const update = this.db
       .query(
-        "UPDATE review_requests SET status = 'posted', posted_at = ?, comment_id = ?, comment_url = ?, error = NULL WHERE request_key = ?",
+        "UPDATE review_requests SET status = 'posted', posted_at = ?, comment_id = ?, comment_url = ?, error = NULL WHERE request_key = ? AND status = 'processing'",
       )
       .run(this.now(), comment.id!, comment.html_url ?? null, key);
+    if (update.changes !== 1) {
+      throw new Error("posted review request could not commit its terminal state");
+    }
   }
 
   async request(input: unknown, caller: VerifiedCaller): Promise<ReviewBrokerResult> {
@@ -373,39 +421,10 @@ export class CoderabbitReviewBroker {
       if (!this.isCallerAllowed(caller)) throw new Error("caller identity/public key is not authorized");
       const req = parseRequest(input);
       this.assertTargetAllowed(req);
-      key = requestKey(req);
-
-      const previous = this.stored(key);
-      if (previous?.status === "posted") {
-        const result: ReviewBrokerResult = {
-          request_id: requestId,
-          repo: req.repo,
-          pr_number: req.pr_number,
-          head_sha: req.expected_head_sha,
-          review_mode: "full",
-          dry_run: Boolean(req.dry_run),
-          posted: true,
-          idempotent: true,
-          comment_id: previous.comment_id ?? undefined,
-          comment_url: previous.comment_url ?? undefined,
-          github_login: this.expectedGithubLogin,
-        };
-        this.audit({ event: "result", caller: caller.source, outcome: "idempotent", ...result });
-        return result;
-      }
-      if (previous?.status === "unsafe_posted") {
-        throw new Error("an earlier post exists but failed readback/drift validation; operator review is required");
-      }
-
-      const postedAt = this.latestPostedAt(req.repo, req.pr_number);
-      if (postedAt !== null && this.now() - postedAt < this.minimumIntervalMs) {
-        throw new Error("review request is rate-limited for this PR");
-      }
-
-      const token = await this.config.tokenSource.getToken();
-      await this.validateIdentityAndPr(token, req);
 
       if (req.dry_run) {
+        const token = await this.config.tokenSource.getToken();
+        await this.validateIdentityAndPr(token, req);
         const result: ReviewBrokerResult = {
           request_id: requestId,
           repo: req.repo,
@@ -420,10 +439,29 @@ export class CoderabbitReviewBroker {
         return result;
       }
 
-      this.reserve(key, req, caller.source, this.now());
+      const decision = this.decideAndReserve(req, caller.source, this.now());
+      key = decision.key;
+      if (decision.kind === "idempotent") {
+        const result: ReviewBrokerResult = {
+          request_id: requestId,
+          repo: req.repo,
+          pr_number: req.pr_number,
+          head_sha: req.expected_head_sha,
+          review_mode: "full",
+          dry_run: false,
+          posted: true,
+          idempotent: true,
+          comment_id: decision.previous.comment_id ?? undefined,
+          comment_url: decision.previous.comment_url ?? undefined,
+          github_login: this.expectedGithubLogin,
+        };
+        this.audit({ event: "result", caller: caller.source, outcome: "idempotent", ...result });
+        return result;
+      }
       reserved = true;
 
-      // Re-read immediately before the irreversible write.
+      const token = await this.config.tokenSource.getToken();
+      // Validate identity and target immediately before the irreversible write.
       await this.validateIdentityAndPr(token, req);
       postAttempted = true;
       const created = await this.githubJson<GithubComment>(
