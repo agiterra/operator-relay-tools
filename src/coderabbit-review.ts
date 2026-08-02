@@ -151,8 +151,13 @@ function parseRequest(input: unknown): CoderabbitReviewRequest {
 }
 
 function requestKey(req: CoderabbitReviewRequest): string {
+  // Include the exact comment text in the key: a template change (e.g. the
+  // "@coderabbitai review" → "@coderabbitai full review" fix) MUST bust dedupe,
+  // otherwise a corrected command is silently masked by an old (pr, head) record.
   return createHash("sha256")
-    .update(`${req.repo}\0${req.pr_number}\0${req.expected_head_sha}\0${req.review_mode}`)
+    .update(
+      `${req.repo}\0${req.pr_number}\0${req.expected_head_sha}\0${req.review_mode}\0${CODERABBIT_FULL_REVIEW_COMMENT}`,
+    )
     .digest("hex");
 }
 
