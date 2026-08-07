@@ -19,12 +19,19 @@ export const EXPECTED_GITHUB_LOGIN = "mividtim";
 const GITHUB_API = "https://api.github.com";
 const SHA_RE = /^[0-9a-f]{40}$/;
 const REPO_RE = /^fabrica-land\/[a-z0-9][a-z0-9._-]{0,99}$/;
+// Same shape as github-comment-capabilities' IDEMPOTENCY_RE — the 2026-07-27
+// idempotency-key rollout added the key to the MCP schema and the comment
+// handlers but NOT here, so clients following the advertised schema were
+// REFUSED by this handler alone ('unexpected request property') and every CR
+// kick on 08-07 died at the broker while reading as "CR stalled".
+const IDEMPOTENCY_RE = /^[A-Za-z0-9][A-Za-z0-9._:-]{15,127}$/;
 const REQUEST_KEYS = new Set([
   "repo",
   "pr_number",
   "review_mode",
   "expected_head_sha",
   "dry_run",
+  "client_idempotency_key",
 ]);
 
 export type CoderabbitReviewRequest = {
@@ -33,6 +40,7 @@ export type CoderabbitReviewRequest = {
   review_mode: "full";
   expected_head_sha: string;
   dry_run?: boolean;
+  client_idempotency_key?: string;
 };
 
 export type VerifiedCaller = {
@@ -141,12 +149,19 @@ function parseRequest(input: unknown): CoderabbitReviewRequest {
   if (raw.dry_run !== undefined && typeof raw.dry_run !== "boolean") {
     throw new Error("dry_run must be a boolean");
   }
+  if (
+    raw.client_idempotency_key !== undefined &&
+    (typeof raw.client_idempotency_key !== "string" || !IDEMPOTENCY_RE.test(raw.client_idempotency_key))
+  ) {
+    throw new Error("client_idempotency_key must be 16-128 safe ASCII characters");
+  }
   return {
     repo: raw.repo,
     pr_number: raw.pr_number as number,
     review_mode: "full",
     expected_head_sha: raw.expected_head_sha,
     dry_run: raw.dry_run as boolean | undefined,
+    client_idempotency_key: raw.client_idempotency_key as string | undefined,
   };
 }
 

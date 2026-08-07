@@ -227,6 +227,30 @@ describe("CoderabbitReviewBroker", () => {
     broker.close();
   });
 
+  // ★ THE 2026-08-07 STALL: the MCP schema advertises client_idempotency_key
+  // and the comment handlers accept it, but THIS handler refused it — every
+  // schema-following full-review kick died at the broker and read as "CR
+  // stalled". The accept path must exist here, not only in the siblings.
+  test("accepts a schema-conformant client_idempotency_key (dry_run)", async () => {
+    const { broker, fake } = makeBroker();
+    const res = await broker.request(
+      { ...request(), dry_run: true, client_idempotency_key: "brioche-1801-round4-kick01" },
+      CALLER,
+    );
+    expect(res.dry_run).toBe(true);
+    expect(fake.posts()).toHaveLength(0);
+    broker.close();
+  });
+
+  test("rejects a malformed client_idempotency_key", async () => {
+    const { broker, fake } = makeBroker();
+    await expect(
+      broker.request({ ...request(), client_idempotency_key: "short" }, CALLER),
+    ).rejects.toThrow(/client_idempotency_key/);
+    expect(fake.calls).toHaveLength(0);
+    broker.close();
+  });
+
   test("internal request initialization cannot override the broker Authorization header", async () => {
     const setup = makeBroker();
     const hidden = setup.broker as unknown as {
