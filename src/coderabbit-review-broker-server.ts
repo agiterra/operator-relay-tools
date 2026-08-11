@@ -13,6 +13,7 @@ import {
   importPrivateKey,
   derivePublicKeyB64,
 } from "@agiterra/wire-tools";
+
 import {
   CODERABBIT_REVIEW_METHOD,
   CoderabbitReviewBroker,
@@ -26,6 +27,22 @@ import {
   parseCapabilityCallers,
 } from "./github-comment-capabilities.js";
 import { githubTokenSourceFromEnv } from "./github-token-source.js";
+
+/**
+ * ⛔⛔ EVERY LINE THIS PROCESS LOGGED WAS UNDATED, WHICH MADE THE LOG USELESS FOR THE ONE
+ * JOB IT HAS (2026-08-11). Brioche reported CodeRabbit silent for ~14 hours; I read 274
+ * non-keepalive lines here and could not tell last night's from July's. The most alarming
+ * of them — `ignored topic 'webhook.github.coderabbit_full_review' from 'brioche'` — is
+ * j:320's symptom VERBATIM from 2026-07-30, already fixed, and I nearly reported it as
+ * current.
+ * ⇒ An undated log does not merely lack detail: it CANNOT ANSWER "did this happen during
+ *   the incident?", which is the only question anyone brings to it. Ordering is not a
+ *   substitute, because keepalives dominate and `tail` spans an unknown period.
+ * ⇒ Timestamps only. This changes WHEN is recorded and nothing about WHAT — the
+ *   never-log-params-headers-bodies-env-or-credentials rule below is untouched.
+ */
+const stamp = () => new Date().toISOString();
+const logLine = (...parts: unknown[]) => console.error(`${stamp()} [coderabbit-review-broker]`, ...parts);
 
 function required(name: string): string {
   const value = process.env[name]?.trim();
@@ -103,7 +120,7 @@ async function main(): Promise<void> {
     // owner-only audit log instead of disappearing at the RPC dispatch layer.
     log: (message, error) => {
       // Never log params, headers, request bodies, env, or credential values.
-      console.error(`[coderabbit-review-broker] ${message}`, error instanceof Error ? error.message : "");
+      logLine(message, error instanceof Error ? error.message : "");
     },
   });
 
@@ -114,15 +131,12 @@ async function main(): Promise<void> {
     keyPair: { privateKey, publicKey },
     deliver: async ({ raw }) => {
       if (await responder.handleEvent(raw)) return;
-      console.error(`[coderabbit-review-broker] ignored topic '${raw.topic}' from '${raw.source}'`);
+      logLine(`ignored topic '${raw.topic}' from '${raw.source}'`);
     },
-    onConnect: () => console.error(`[coderabbit-review-broker] connected as ${agentId}`),
-    onDisconnect: () => console.error("[coderabbit-review-broker] disconnected"),
+    onConnect: () => logLine(`connected as ${agentId}`),
+    onDisconnect: () => logLine("disconnected"),
     onError: (error) =>
-      console.error(
-        "[coderabbit-review-broker] Wire error",
-        error instanceof Error ? error.message : String(error),
-      ),
+      logLine("Wire error", error instanceof Error ? error.message : String(error)),
   });
 
   const stop = async () => {
@@ -137,6 +151,6 @@ async function main(): Promise<void> {
 }
 
 main().catch((error) => {
-  console.error("[coderabbit-review-broker] fatal", error instanceof Error ? error.message : String(error));
+  logLine("fatal", error instanceof Error ? error.message : String(error));
   process.exit(1);
 });
