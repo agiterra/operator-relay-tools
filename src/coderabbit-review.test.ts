@@ -35,6 +35,8 @@ type FakeOptions = {
   readbackLogin?: string;
   driftAfterPost?: boolean;
   postThrows?: boolean;
+  /** issue comments returned for GET /issues/42/comments?since=... (CodeRabbit replies) */
+  comments?: Array<{ id: number; body: string; login: string; created_at: string }>;
 };
 
 function fakeGithub(options: FakeOptions = {}) {
@@ -59,6 +61,11 @@ function fakeGithub(options: FakeOptions = {}) {
         head: { sha: returnedHead },
         base: { repo: { full_name: options.repo ?? REPO } },
       });
+    }
+    if (url.includes("/issues/42/comments?since=") && method === "GET") {
+      return Response.json(
+        (options.comments ?? []).map((c) => ({ id: c.id, body: c.body, user: { login: c.login }, created_at: c.created_at })),
+      );
     }
     if (url.endsWith("/issues/42/comments") && method === "POST") {
       posted = true;
@@ -185,6 +192,32 @@ describe("CoderabbitReviewBroker", () => {
     await expect(
       setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-1827-real-0116" }), CALLER),
     ).rejects.toThrow(/rate-limited/);
+  });
+
+  test("waives the per-PR interval when CodeRabbit refused the last trigger, and reports its reset minutes", async () => {
+    const fake = fakeGithub({
+      comments: [{ id: 5504335732, body: "Review rate limited. Action not completed. Next included review in 4 minutes.", login: "coderabbitai[bot]", created_at: new Date(1_700_000_007_000).toISOString() }],
+    });
+    const setup = makeBroker(fake, undefined, 30 * 60_000);
+    const first = await setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-1340-real-0422" }), CALLER);
+    expect(first.posted).toBe(true);
+    setup.advance(5 * 60_000);
+    const retry = await setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-1340-real-0427" }), CALLER);
+    expect(retry.posted).toBe(true);
+    expect(retry.previous_trigger_refused).toBe(true);
+    expect(retry.coderabbit_reset_minutes).toBe(4);
+    expect(fake.posts()).toHaveLength(2);
+  });
+
+  test("keeps the per-PR interval when CodeRabbit did NOT refuse the last trigger", async () => {
+    const fake = fakeGithub({ comments: [{ id: 1, body: "Walkthrough: reviewed 3 files.", login: "coderabbitai[bot]", created_at: new Date(1_700_000_020_000).toISOString() }] });
+    const setup = makeBroker(fake, undefined, 30 * 60_000);
+    await setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-1340-real-0422" }), CALLER);
+    setup.advance(5 * 60_000);
+    await expect(
+      setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-1340-real-0427" }), CALLER),
+    ).rejects.toThrow(/rate-limited/);
+    expect(fake.posts()).toHaveLength(1);
   });
 
   test("serializes concurrent identical requests into one post", async () => {

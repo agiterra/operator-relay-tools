@@ -61,6 +61,11 @@ export type ReviewBrokerResult = {
   comment_id?: number;
   comment_url?: string;
   github_login: string;
+  /** The last posted trigger on this PR drew a CodeRabbit rate-limited reply, so the
+   *  per-PR minimum interval was waived for this request. */
+  previous_trigger_refused?: boolean;
+  /** Minutes until CodeRabbit's next included review, parsed from its refusal reply. */
+  coderabbit_reset_minutes?: number;
 };
 
 type Fetch = typeof globalThis.fetch;
@@ -88,7 +93,15 @@ type GithubComment = {
   body?: string;
   html_url?: string;
   user?: { login?: string };
+  created_at?: string;
 };
+
+/** CodeRabbit's reply when the org allowance is exhausted; it names the reset. */
+const CODERABBIT_REFUSAL_RE = /Review rate limited|Action not completed|rate.?limit/i;
+const CODERABBIT_RESET_MINUTES_RE = /in\s+(\d+)\s+minutes?/i;
+const CODERABBIT_LOGIN_RE = /^coderabbitai(\[bot\])?$/i;
+
+export type TriggerRefusal = { refused: true; reset_minutes: number | null; comment_id: number | null };
 
 type StoredRequest = {
   status: string;
@@ -330,6 +343,40 @@ export class CoderabbitReviewBroker {
       .get(key) ?? null;
   }
 
+  /**
+   * Did CodeRabbit REFUSE the broker's last posted trigger on this PR? (2026-09-02, Brioche:
+   * CR answers an exhausted org allowance with "Review rate limited ... next included review
+   * in N minutes". Counting that refused trigger against the per-PR minimum interval blocked
+   * the PR for 30 min while CR itself said 4.) Reads the PR's issue comments since the last
+   * post and looks for a coderabbitai reply matching the refusal wording. Network failure or
+   * no reply = not refused (the interval stays; never waive on a guess).
+   */
+  private async lastTriggerRefusal(token: string, repo: string, pr: number): Promise<TriggerRefusal | null> {
+    const postedAt = this.latestPostedAt(repo, pr);
+    if (postedAt === null) return null;
+    let comments: GithubComment[];
+    try {
+      const since = new Date(postedAt).toISOString();
+      comments = await this.githubJson<GithubComment[]>(
+        token,
+        this.githubPath(repo, `/issues/${pr}/comments?since=${encodeURIComponent(since)}&per_page=100`),
+      );
+    } catch {
+      return null;
+    }
+    if (!Array.isArray(comments)) return null;
+    for (const c of comments) {
+      const login = c.user?.login ?? "";
+      const createdAt = c.created_at ? Date.parse(c.created_at) : NaN;
+      if (!CODERABBIT_LOGIN_RE.test(login)) continue;
+      if (!Number.isFinite(createdAt) || createdAt < postedAt) continue;
+      if (!CODERABBIT_REFUSAL_RE.test(c.body ?? "")) continue;
+      const m = CODERABBIT_RESET_MINUTES_RE.exec(c.body ?? "");
+      return { refused: true, reset_minutes: m ? Number(m[1]) : null, comment_id: c.id ?? null };
+    }
+    return null;
+  }
+
   private latestPostedAt(repo: string, pr: number): number | null {
     const row = this.db
       .query<{ posted_at: number | null }, [string, number]>(
@@ -343,6 +390,7 @@ export class CoderabbitReviewBroker {
     req: CoderabbitReviewRequest,
     caller: string,
     now: number,
+    intervalWaived = false,
   ): ReservationDecision {
     const key = requestKey(req);
     const transaction = this.db.transaction(() => {
@@ -370,7 +418,7 @@ export class CoderabbitReviewBroker {
       }
 
       const postedAt = this.latestPostedAt(req.repo, req.pr_number);
-      if (postedAt !== null && now - postedAt < this.minimumIntervalMs) {
+      if (!intervalWaived && postedAt !== null && now - postedAt < this.minimumIntervalMs) {
         throw new Error("review request is rate-limited for this PR");
       }
 
@@ -465,7 +513,20 @@ export class CoderabbitReviewBroker {
         return result;
       }
 
-      const decision = this.decideAndReserve(req, caller.source, this.now());
+      const tokenForCheck = await this.config.tokenSource.getToken();
+      const refusal = await this.lastTriggerRefusal(tokenForCheck, req.repo, req.pr_number);
+      if (refusal) {
+        this.audit({
+          event: "previous_trigger_refused",
+          request_id: requestId,
+          caller: caller.source,
+          repo: req.repo,
+          pr_number: req.pr_number,
+          coderabbit_comment_id: refusal.comment_id,
+          coderabbit_reset_minutes: refusal.reset_minutes,
+        });
+      }
+      const decision = this.decideAndReserve(req, caller.source, this.now(), Boolean(refusal));
       key = decision.key;
       if (decision.kind === "idempotent") {
         const result: ReviewBrokerResult = {
@@ -534,6 +595,7 @@ export class CoderabbitReviewBroker {
         dry_run: false,
         posted: true,
         idempotent: false,
+        ...(refusal ? { previous_trigger_refused: true, ...(refusal.reset_minutes !== null ? { coderabbit_reset_minutes: refusal.reset_minutes } : {}) } : {}),
         comment_id: readback.id,
         comment_url: readback.html_url,
         github_login: this.expectedGithubLogin,
