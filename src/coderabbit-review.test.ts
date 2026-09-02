@@ -159,6 +159,34 @@ describe("CoderabbitReviewBroker", () => {
     broker.close();
   });
 
+  test("a fresh client_idempotency_key re-triggers on an unchanged head after the interval; the same key stays idempotent", async () => {
+    const setup = makeBroker();
+    const first = await setup.broker.request(
+      request({ dry_run: false, client_idempotency_key: "brioche-1827-real-0042" }),
+      CALLER,
+    );
+    expect(first.posted).toBe(true);
+    // CodeRabbit answered the first trigger "Review rate limited"; the head did not move.
+    setup.advance(61_000);
+    const same = await setup.broker.request(
+      request({ dry_run: false, client_idempotency_key: "brioche-1827-real-0042" }),
+      CALLER,
+    );
+    expect(same.idempotent).toBe(true);
+    expect(setup.fake.posts()).toHaveLength(1);
+    const fresh = await setup.broker.request(
+      request({ dry_run: false, client_idempotency_key: "brioche-1827-real-0115" }),
+      CALLER,
+    );
+    expect(fresh.posted).toBe(true);
+    expect(fresh.idempotent).toBeFalsy();
+    expect(setup.fake.posts()).toHaveLength(2);
+    // inside the interval a fresh key is still refused: the key busts dedupe, not the throttle
+    await expect(
+      setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-1827-real-0116" }), CALLER),
+    ).rejects.toThrow(/rate-limited/);
+  });
+
   test("serializes concurrent identical requests into one post", async () => {
     const { broker, fake } = makeBroker();
     const results = await Promise.allSettled([

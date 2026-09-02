@@ -169,9 +169,15 @@ function requestKey(req: CoderabbitReviewRequest): string {
   // Include the exact comment text in the key: a template change (e.g. the
   // "@coderabbitai review" → "@coderabbitai full review" fix) MUST bust dedupe,
   // otherwise a corrected command is silently masked by an old (pr, head) record.
+  // 2026-09-01 (Brioche, api #1827): the client key was validated but never keyed, so once a
+  // (pr, head) request was 'posted' nothing could re-trigger CodeRabbit on an unchanged head —
+  // even after CodeRabbit itself answered "Review rate limited" and reviewed nothing. A caller
+  // that supplies a FRESH client_idempotency_key now gets a fresh request (still subject to
+  // the per-PR minimum interval); the SAME key stays idempotent; omitting it keeps the old
+  // (repo, pr, head, mode, comment) dedupe unchanged.
   return createHash("sha256")
     .update(
-      `${req.repo}\0${req.pr_number}\0${req.expected_head_sha}\0${req.review_mode}\0${CODERABBIT_FULL_REVIEW_COMMENT}`,
+      `${req.repo}\0${req.pr_number}\0${req.expected_head_sha}\0${req.review_mode}\0${CODERABBIT_FULL_REVIEW_COMMENT}\0${req.client_idempotency_key ?? ""}`,
     )
     .digest("hex");
 }
