@@ -222,6 +222,49 @@ describe("CoderabbitReviewBroker", () => {
     broker.close();
   });
 
+  test("declare mode posts the author declaration AND the review command in one comment", async () => {
+    const { broker, fake } = makeBroker();
+    const result = await broker.request(request({ dry_run: false, review_mode: "declare" }), CALLER);
+    expect(result.review_mode).toBe("declare");
+    expect(result.posted).toBe(true);
+    const body = (fake.posts()[0]!.body as { body: string }).body;
+    expect(body).toContain("agentic");
+    expect(body).toContain("not a review bot");
+    // one comment does both jobs: two would trip the per-PR interval against each other
+    expect(body).toContain("@coderabbitai review");
+    // ★ readback must ACCEPT the attributed body, or a real PR gets a comment then unsafe_posted
+    expect(result.comment_id).toBe(9001);
+    broker.close();
+  });
+
+  test("the declaration carries in-artifact attribution, and it is the REQUEST ID not the caller", async () => {
+    // A broker comment appears under the operator's own login and is indistinguishable from
+    // something he typed. The caller id is caller-supplied text and must not land inside a
+    // comment written under someone else's identity; the request id is broker-generated.
+    const { broker, fake } = makeBroker();
+    const result = await broker.request(request({ dry_run: false, review_mode: "declare" }), CALLER);
+    const body = (fake.posts()[0]!.body as { body: string }).body;
+    expect(body).toContain(result.request_id);
+    expect(body).not.toContain(CALLER.source);
+    broker.close();
+  });
+
+  test("⛔ review and full bodies are UNCHANGED by the attribution work", async () => {
+    // Their whole body IS the command, and whether CodeRabbit tolerates trailing text after one
+    // is unmeasured. This asserts the bytes, so a future attribution change cannot quietly reach
+    // the commands that demonstrably work.
+    const a = makeBroker();
+    const ra = request({ dry_run: false });
+    delete (ra as Partial<CoderabbitReviewRequest>).review_mode;
+    await a.broker.request(ra, CALLER);
+    expect((a.fake.posts()[0]!.body as { body: string }).body).toBe("@coderabbitai review");
+    a.broker.close();
+    const b = makeBroker(fakeGithub({ repo: "fabrica-land/soil-app" }));
+    await b.broker.request(request({ dry_run: false, review_mode: "full", repo: "fabrica-land/soil-app" }), CALLER);
+    expect((b.fake.posts()[0]!.body as { body: string }).body).toBe(CODERABBIT_FULL_REVIEW_COMMENT);
+    b.broker.close();
+  });
+
   // ── EPHEMERAL LANE AUTHORISATION ─────────────────────────────────────────────────────────
   // Tim, 2026-09-18: "Just give access to the ephemeral agents." Lanes are created and destroyed
   // constantly, so a per-key allow-list cannot hold them — eng-4203-board was refused today while
