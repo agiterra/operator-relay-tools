@@ -8,6 +8,7 @@ import {
   CODERABBIT_FULL_REVIEW_COMMENT,
   CoderabbitReviewBroker,
   type CoderabbitReviewRequest,
+  parseAllowedCallerPatterns,
 } from "./coderabbit-review.js";
 import { FineGrainedPatFileTokenSource } from "./github-token-source.js";
 
@@ -219,6 +220,74 @@ describe("CoderabbitReviewBroker", () => {
     ).rejects.toThrow(/review_mode/);
     expect(fake.posts()).toHaveLength(0);   // a typo must not post anything at all
     broker.close();
+  });
+
+  // ── EPHEMERAL LANE AUTHORISATION ─────────────────────────────────────────────────────────
+  // Tim, 2026-09-18: "Just give access to the ephemeral agents." Lanes are created and destroyed
+  // constantly, so a per-key allow-list cannot hold them — eng-4203-board was refused today while
+  // holding a perfectly valid key. Patterns widen WHICH signed identities may call.
+
+  function patternBroker(patterns: RegExp[]) {
+    const tokenFile = join(dir, "github-token");
+    writeFileSync(tokenFile, "github_pat_owner-secret-token\n", { mode: 0o600 });
+    chmodSync(tokenFile, 0o600);
+    return new CoderabbitReviewBroker({
+      allowedRepos: new Set([REPO]),
+      allowedCallers: new Map([["brioche", new Set([CALLER.sourcePubkey])]]),
+      allowedCallerPatterns: patterns,
+      tokenSource: new FineGrainedPatFileTokenSource(tokenFile),
+      stateFile: join(dir, "state", "requests.sqlite"),
+      auditFile: join(dir, "audit", "requests.jsonl"),
+      minimumIntervalMs: 60_000,
+      fetchImpl: fakeGithub().fetchImpl,
+      now: () => 1_700_000_000_000,
+    });
+  }
+
+  test("a lane matching the pattern, WITH a verified key, is authorised", () => {
+    const b = patternBroker([/^eng-[a-z0-9-]+$/]);
+    expect(b.callerGrant({ source: "eng-4203-board", sourcePubkey: "lane-key-000000001" })).toBe("pattern");
+    b.close();
+  });
+
+  test("⛔ a pattern match WITHOUT a verified key is REFUSED", () => {
+    // The security property. A pattern widens which SIGNED identities may call; it must never
+    // remove the signature requirement, or anyone can name itself eng-whatever.
+    const b = patternBroker([/^eng-[a-z0-9-]+$/]);
+    expect(b.callerGrant({ source: "eng-4203-board", sourcePubkey: null })).toBeNull();
+    expect(b.isCallerAllowed({ source: "eng-4203-board", sourcePubkey: undefined })).toBe(false);
+    b.close();
+  });
+
+  test("a name that does not match the pattern is still refused", () => {
+    const b = patternBroker([/^eng-[a-z0-9-]+$/]);
+    expect(b.callerGrant({ source: "mallory", sourcePubkey: "lane-key-000000001" })).toBeNull();
+    // ★ the anchors doing their job: near-misses on both ends
+    expect(b.callerGrant({ source: "not-eng-really", sourcePubkey: "lane-key-000000001" })).toBeNull();
+    expect(b.callerGrant({ source: "eng-4203-board.evil", sourcePubkey: "lane-key-000000001" })).toBeNull();
+    b.close();
+  });
+
+  test("explicit callers still work and are reported as such", () => {
+    const b = patternBroker([/^eng-[a-z0-9-]+$/]);
+    expect(b.callerGrant(CALLER)).toBe("explicit");
+    // an explicit caller with the WRONG key is refused, pattern or not
+    expect(b.callerGrant({ source: "brioche", sourcePubkey: "wrong-key-00000001" })).toBeNull();
+    b.close();
+  });
+
+  test("⛔ an UNANCHORED pattern is refused at construction, not silently widened", () => {
+    expect(() => patternBroker([/eng-/])).toThrow(/anchored/);
+    expect(() => parseAllowedCallerPatterns("eng-")).toThrow(/anchored/);
+    expect(() => parseAllowedCallerPatterns("^.*$")).toThrow(/every caller/);
+  });
+
+  test("parseAllowedCallerPatterns handles a real env value", () => {
+    const res = parseAllowedCallerPatterns("^eng-[a-z0-9-]+$, ^lane-[a-z0-9-]+$");
+    expect(res).toHaveLength(2);
+    expect(res[0]!.test("eng-4203-board")).toBe(true);
+    expect(res[0]!.test("brioche")).toBe(false);
+    expect(parseAllowedCallerPatterns(undefined)).toHaveLength(0);
   });
 
   test("is idempotent for repo, PR, head, and mode", async () => {

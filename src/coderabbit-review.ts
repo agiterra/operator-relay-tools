@@ -100,6 +100,18 @@ type Fetch = typeof globalThis.fetch;
 export type ReviewBrokerConfig = {
   allowedRepos: ReadonlySet<string>;
   allowedCallers: ReadonlyMap<string, ReadonlySet<string>>;
+  /**
+   * Anchored patterns matching EPHEMERAL caller ids (Tim, 2026-09-18: "Just give access to the
+   * ephemeral agents."). Lanes are created and destroyed constantly, so enumerating them by
+   * public key cannot work — that is why eng-4203-board was refused while holding a valid key.
+   * ⛔ A PATTERN MATCH STILL REQUIRES A VERIFIED KEY. The pattern widens WHICH signed identities
+   * may call; it never removes the signature requirement. Without that an unsigned caller could
+   * simply name itself `eng-anything`.
+   * ⚠️ The trust boundary this creates, stated plainly: anyone who can register a Wire identity
+   * matching a pattern can trigger a review. Everything else still binds — allowlisted repos,
+   * fixed comment text, mandatory expected head, per-PR cooldown, full audit.
+   */
+  allowedCallerPatterns?: readonly RegExp[];
   tokenSource: GithubTokenSource;
   stateFile: string;
   auditFile: string;
@@ -244,7 +256,17 @@ export class CoderabbitReviewBroker {
 
   constructor(private readonly config: ReviewBrokerConfig) {
     if (config.allowedRepos.size === 0) throw new Error("at least one repository must be allowlisted");
-    if (config.allowedCallers.size === 0) throw new Error("at least one caller must be allowlisted");
+    if (config.allowedCallers.size === 0 && (config.allowedCallerPatterns ?? []).length === 0) {
+      throw new Error("at least one caller or caller pattern must be allowlisted");
+    }
+    for (const re of config.allowedCallerPatterns ?? []) {
+      // Anchored at BOTH ends or the pattern authorises far more than it appears to: an
+      // unanchored /eng-/ matches "not-eng-really" and "eng-" inside any longer id.
+      if (!re.source.startsWith("^") || !re.source.endsWith("$")) {
+        throw new Error(`caller pattern ${re} must be anchored at both ends`);
+      }
+      if (re.global || re.sticky) throw new Error(`caller pattern ${re} must not be global or sticky`);
+    }
     for (const repo of config.allowedRepos) this.validateRepo(repo);
     for (const [source, keys] of config.allowedCallers) {
       if (!/^[A-Za-z0-9][A-Za-z0-9@._-]{0,127}$/.test(source) || keys.size === 0) {
@@ -304,9 +326,20 @@ export class CoderabbitReviewBroker {
     this.db.close();
   }
 
-  isCallerAllowed(caller: VerifiedCaller): boolean {
+  /** How a caller was authorised, or null. Returned (not just booleaned) so the audit records it. */
+  callerGrant(caller: VerifiedCaller): "explicit" | "pattern" | null {
+    // ⛔ NO VERIFIED KEY => NO GRANT, by either route. Checked first so neither path can skip it.
+    if (!caller.sourcePubkey) return null;
     const keys = this.config.allowedCallers.get(caller.source);
-    return Boolean(caller.sourcePubkey && keys?.has(caller.sourcePubkey));
+    if (keys?.has(caller.sourcePubkey)) return "explicit";
+    for (const re of this.config.allowedCallerPatterns ?? []) {
+      if (re.test(caller.source)) return "pattern";
+    }
+    return null;
+  }
+
+  isCallerAllowed(caller: VerifiedCaller): boolean {
+    return this.callerGrant(caller) !== null;
   }
 
   private validateRepo(repo: string): void {
@@ -518,6 +551,7 @@ export class CoderabbitReviewBroker {
       request_id: requestId,
       caller: caller.source,
       verified_key_present: Boolean(caller.sourcePubkey),
+      caller_grant: this.callerGrant(caller) ?? "none",
       repo: typeof raw.repo === "string" ? raw.repo : null,
       pr_number: typeof raw.pr_number === "number" ? raw.pr_number : null,
       dry_run: raw.dry_run === true,
@@ -666,6 +700,30 @@ export class CoderabbitReviewBroker {
 
 export function parseAllowedRepos(value: string): ReadonlySet<string> {
   return new Set(value.split(",").map((item) => item.trim()).filter(Boolean));
+}
+
+/**
+ * Parse anchored caller patterns from a comma-separated env value, e.g. "^eng-[a-z0-9-]+$".
+ *
+ * ⛔ REFUSES AN UNANCHORED OR EMPTY PATTERN rather than accepting one that authorises more than it
+ * reads as. `eng-` unanchored matches "not-eng-really"; `.*` would authorise every signed caller
+ * on the bus. Both throw here, at startup, instead of silently widening the grant.
+ * ⚠️ Metacharacters are NOT escaped — these are regexes on purpose, and the value comes from the
+ * daemon's own plist, which is root-owned. It is not caller-supplied input.
+ */
+export function parseAllowedCallerPatterns(value: string | undefined): readonly RegExp[] {
+  const parts = (value ?? "").split(",").map((v) => v.trim()).filter(Boolean);
+  return parts.map((src) => {
+    if (!src.startsWith("^") || !src.endsWith("$")) {
+      throw new Error(`caller pattern '${src}' must be anchored with ^ and $`);
+    }
+    if (src === "^.*$" || src === "^.+$") {
+      throw new Error(`caller pattern '${src}' matches every caller; enumerate or narrow it`);
+    }
+    let re: RegExp;
+    try { re = new RegExp(src); } catch { throw new Error(`caller pattern '${src}' is not a valid regex`); }
+    return re;
+  });
 }
 
 export function parseAllowedCallers(value: string): ReadonlyMap<string, ReadonlySet<string>> {
