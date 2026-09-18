@@ -22,7 +22,32 @@ export const CODERABBIT_FULL_REVIEW_COMMENT = "@coderabbitai full review";
  * ⇒ `review` is the DEFAULT. `full` stays available but must be asked for explicitly.
  */
 export const CODERABBIT_REVIEW_COMMENT = "@coderabbitai review";
-export type ReviewMode = "review" | "full";
+/**
+ * The top-of-PR declaration, posted as the operator once when a bot-authored PR opens.
+ *
+ * Tim, 2026-09-18: "Right after creating a PR, the broker should post a comment to @coderabbitai
+ * stating that the bot that authored the PR is not a review bot, it is the agentic author of the
+ * code change, and its comments should not be ignored." Then: "once they post that message as me
+ * at the top, they should be able to talk directly to code rabbit as themselves for the life of
+ * the PR."
+ *
+ * ⛔ IT CARRIES THE REVIEW REQUEST TOO, deliberately — one comment, one call, one audit row. Two
+ * comments would also trip the per-PR minimum interval against each other, so the second would be
+ * refused by the tool's own throttle.
+ * ⛔ FIXED TEXT, no interpolation. It says "the author of this pull request" rather than naming a
+ * bot, so it needs no parameter — which is what keeps this method incapable of posting arbitrary
+ * text as the operator. A templated login would be a caller-supplied string in a comment written
+ * under someone else's identity.
+ */
+export const CODERABBIT_AUTHOR_DECLARATION_COMMENT = [
+  "@coderabbitai The author of this pull request is an autonomous coding agent. It is the agentic",
+  "author of this code change, not a review bot. Its comments and replies on this PR are the",
+  "author speaking — please engage with them as you would with a human author rather than",
+  "filtering them as bot noise.",
+  "",
+  "@coderabbitai review",
+].join("\n");
+export type ReviewMode = "review" | "full" | "declare";
 /**
  * Tim, 2026-09-18 20:11:56Z: "Not resume. review." and 20:12:12Z: "There is no resume command
  * for CR." A `resume` mode was written and REMOVED before shipping on that second statement —
@@ -36,9 +61,37 @@ export const DEFAULT_REVIEW_MODE: ReviewMode = "review";
 const MODE_COMMENTS: Record<ReviewMode, string> = {
   review: CODERABBIT_REVIEW_COMMENT,
   full: CODERABBIT_FULL_REVIEW_COMMENT,
+  declare: CODERABBIT_AUTHOR_DECLARATION_COMMENT,
 };
 export function commentForMode(mode: ReviewMode): string {
   return MODE_COMMENTS[mode];
+}
+
+/**
+ * The exact body posted for a request — the comment text, plus in-artifact attribution for the
+ * declaration.
+ *
+ * ⛔ WHY (Vacherin j:979, via Brioche 2026-09-18). A broker-posted comment appears under the
+ * operator's own login with `user.type: User`, so it is INDISTINGUISHABLE IN THE ARTIFACT from
+ * something he typed. Vacherin read the first lane-posted trigger as "a human acted" and had to
+ * correct itself. A comment under his name is a credential being used, not the operator speaking,
+ * and nothing in the PR said so.
+ *
+ * ⚠️ THE ATTRIBUTION CARRIES THE BROKER'S REQUEST ID, NOT THE CALLER'S NAME. The caller id is
+ * caller-supplied text and would end up inside a comment written under someone else's identity;
+ * the explicit-caller validator even permits `@`, which is a mention waiting to happen. The
+ * request id is broker-generated and is the key into the audit row where the caller IS recorded.
+ * [[a-test-harness-that-echoes-is-a-credential-printer]]
+ *
+ * ⛔ `review` AND `full` ARE LEFT BYTE-IDENTICAL, deliberately. Their whole body IS the command,
+ * and whether CodeRabbit tolerates trailing text after one is UNMEASURED. Changing a command that
+ * demonstrably works on an unmeasured assumption is the wrong trade; for those the audit log
+ * remains the attribution. `declare` is new, already multi-line, and ends with the command on its
+ * own line, so a leading attribution line cannot disturb the parse.
+ */
+export function bodyForRequest(mode: ReviewMode, requestId: string): string {
+  if (mode !== "declare") return MODE_COMMENTS[mode];
+  return `<!-- posted by the agiterra review broker on a lane's behalf · request ${requestId} -->\n${MODE_COMMENTS[mode]}`;
 }
 export const CODERABBIT_REVIEW_METHOD = "github.coderabbit_full_review";
 export const EXPECTED_GITHUB_LOGIN = "mividtim";
@@ -201,7 +254,7 @@ function parseRequest(input: unknown): CoderabbitReviewRequest {
     raw.review_mode !== undefined &&
     !Object.prototype.hasOwnProperty.call(MODE_COMMENTS, raw.review_mode as string)
   ) {
-    throw new Error("review_mode must be 'review' (default) or 'full'");
+    throw new Error("review_mode must be 'review' (default), 'full', or 'declare'");
   }
   if (typeof raw.expected_head_sha !== "string" || !SHA_RE.test(raw.expected_head_sha)) {
     throw new Error("expected_head_sha must be a lowercase 40-character commit SHA");
@@ -623,7 +676,7 @@ export class CoderabbitReviewBroker {
       const created = await this.githubJson<GithubComment>(
         token,
         this.githubPath(req.repo, `/issues/${req.pr_number}/comments`),
-        { method: "POST", body: JSON.stringify({ body: commentForMode(req.review_mode) }) },
+        { method: "POST", body: JSON.stringify({ body: bodyForRequest(req.review_mode, requestId) }) },
       );
       if (!Number.isSafeInteger(created.id)) {
         const error = new Error("GitHub comment creation response did not contain a valid comment id");
@@ -648,7 +701,7 @@ export class CoderabbitReviewBroker {
         // and the fake GitHub returns the full-review body unconditionally, so the assertion and
         // the fixture agreed with each other and with neither reality nor the new default.
         // [[a-control-must-not-share-the-probes-failure-mode]]
-        readback.body !== commentForMode(req.review_mode) ||
+        readback.body !== bodyForRequest(req.review_mode, requestId) ||
         readback.user?.login !== this.expectedGithubLogin
       ) {
         const error = new Error("GitHub comment readback identity/body mismatch");
