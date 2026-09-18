@@ -18,6 +18,7 @@ import {
   CODERABBIT_REVIEW_METHOD,
   CoderabbitReviewBroker,
   parseAllowedCallers,
+  parseAllowedCallerPatterns,
   parseAllowedRepos,
 } from "./coderabbit-review.js";
 import {
@@ -72,6 +73,11 @@ async function main(): Promise<void> {
   const broker = new CoderabbitReviewBroker({
     allowedRepos,
     allowedCallers: parseAllowedCallers(required("CODERABBIT_BROKER_ALLOWED_CALLERS_JSON")),
+    // Ephemeral lanes are authorised by NAME PATTERN + a verified key, because they are created
+    // and destroyed constantly and cannot be enumerated by public key (Tim, 2026-09-18).
+    allowedCallerPatterns: parseAllowedCallerPatterns(
+      process.env.CODERABBIT_BROKER_ALLOWED_CALLER_PATTERNS,
+    ),
     tokenSource,
     stateFile,
     auditFile,
