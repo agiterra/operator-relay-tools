@@ -123,7 +123,10 @@ async function main(): Promise<void> {
       {
         name: FULL_REVIEW_TOOL,
         description:
-          "Ask the owner-only broker to post the fixed '@coderabbitai full review' command on an allowlisted open Fabrica PR. " +
+          "Ask the owner-only broker to post a fixed CodeRabbit command on an allowlisted open Fabrica PR. " +
+          "review_mode selects WHICH fixed command: 'review' (default, incremental \u2014 the routine trigger) " +
+          "or 'full' (re-review the WHOLE PR \u2014 the " +
+          "expensive command, ask for it explicitly and only when a full re-review is actually wanted). " +
           "The expected head SHA is mandatory; use dry_run first. No arbitrary comment text is accepted.",
         inputSchema: {
           type: "object" as const,
@@ -135,11 +138,11 @@ async function main(): Promise<void> {
               pattern: "^fabrica-land/[a-z0-9][a-z0-9._-]{0,99}$",
             },
             pr_number: { type: "integer", minimum: 1 },
-            review_mode: { type: "string", enum: ["full"] },
+            review_mode: { type: "string", enum: ["review", "full"], default: "review" },
             expected_head_sha: { type: "string", pattern: "^[0-9a-f]{40}$" },
             dry_run: { type: "boolean", default: true },
           },
-          required: ["repo", "pr_number", "review_mode", "expected_head_sha", "dry_run"],
+          required: ["repo", "pr_number", "expected_head_sha", "dry_run"],
         },
       },
       {

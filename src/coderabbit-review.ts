@@ -13,6 +13,33 @@ import { dirname } from "node:path";
 import type { GithubTokenSource } from "./github-token-source.js";
 
 export const CODERABBIT_FULL_REVIEW_COMMENT = "@coderabbitai full review";
+/**
+ * ⛔ THE ROUTINE TRIGGER IS `review`, NOT `full review` (Tim, 2026-09-18).
+ * `full review` re-reviews the WHOLE PR and is the expensive command. It was the broker's ONLY
+ * mode, so every trigger this tool could express was the costly one — which is how it came to
+ * post `full review` as the routine case. `review` is the incremental command and is what the
+ * routine case wants.
+ * ⇒ `review` is the DEFAULT. `full` stays available but must be asked for explicitly.
+ */
+export const CODERABBIT_REVIEW_COMMENT = "@coderabbitai review";
+export type ReviewMode = "review" | "full";
+/**
+ * Tim, 2026-09-18 20:11:56Z: "Not resume. review." and 20:12:12Z: "There is no resume command
+ * for CR." A `resume` mode was written and REMOVED before shipping on that second statement —
+ * recorded here so nobody re-adds it from the earlier instruction in the thread.
+ */
+export const DEFAULT_REVIEW_MODE: ReviewMode = "review";
+/**
+ * The exact comment text a mode posts. ONE source of truth — the dedupe key hashes this too, so
+ * a mode change always busts dedupe and a corrected command is never masked by an old record.
+ */
+const MODE_COMMENTS: Record<ReviewMode, string> = {
+  review: CODERABBIT_REVIEW_COMMENT,
+  full: CODERABBIT_FULL_REVIEW_COMMENT,
+};
+export function commentForMode(mode: ReviewMode): string {
+  return MODE_COMMENTS[mode];
+}
 export const CODERABBIT_REVIEW_METHOD = "github.coderabbit_full_review";
 export const EXPECTED_GITHUB_LOGIN = "mividtim";
 
@@ -37,7 +64,7 @@ const REQUEST_KEYS = new Set([
 export type CoderabbitReviewRequest = {
   repo: string;
   pr_number: number;
-  review_mode: "full";
+  review_mode: ReviewMode;
   expected_head_sha: string;
   dry_run?: boolean;
   client_idempotency_key?: string;
@@ -53,7 +80,7 @@ export type ReviewBrokerResult = {
   repo: string;
   pr_number: number;
   head_sha: string;
-  review_mode: "full";
+  review_mode: ReviewMode;
   dry_run: boolean;
   would_post?: boolean;
   posted?: boolean;
@@ -155,7 +182,15 @@ function parseRequest(input: unknown): CoderabbitReviewRequest {
   if (!Number.isSafeInteger(raw.pr_number) || (raw.pr_number as number) < 1) {
     throw new Error("pr_number must be a positive integer");
   }
-  if (raw.review_mode !== "full") throw new Error("review_mode must be exactly 'full'");
+  // Absent => the default (review). An explicit value must be one of the two known modes; an
+  // unknown string is rejected rather than silently coerced, so a typo can never post the
+  // expensive command by accident.
+  if (
+    raw.review_mode !== undefined &&
+    !Object.prototype.hasOwnProperty.call(MODE_COMMENTS, raw.review_mode as string)
+  ) {
+    throw new Error("review_mode must be 'review' (default) or 'full'");
+  }
   if (typeof raw.expected_head_sha !== "string" || !SHA_RE.test(raw.expected_head_sha)) {
     throw new Error("expected_head_sha must be a lowercase 40-character commit SHA");
   }
@@ -171,7 +206,7 @@ function parseRequest(input: unknown): CoderabbitReviewRequest {
   return {
     repo: raw.repo,
     pr_number: raw.pr_number as number,
-    review_mode: "full",
+    review_mode: (raw.review_mode as ReviewMode | undefined) ?? DEFAULT_REVIEW_MODE,
     expected_head_sha: raw.expected_head_sha,
     dry_run: raw.dry_run as boolean | undefined,
     client_idempotency_key: raw.client_idempotency_key as string | undefined,
@@ -190,7 +225,7 @@ function requestKey(req: CoderabbitReviewRequest): string {
   // (repo, pr, head, mode, comment) dedupe unchanged.
   return createHash("sha256")
     .update(
-      `${req.repo}\0${req.pr_number}\0${req.expected_head_sha}\0${req.review_mode}\0${CODERABBIT_FULL_REVIEW_COMMENT}\0${req.client_idempotency_key ?? ""}`,
+      `${req.repo}\0${req.pr_number}\0${req.expected_head_sha}\0${req.review_mode}\0${commentForMode(req.review_mode)}\0${req.client_idempotency_key ?? ""}`,
     )
     .digest("hex");
 }
@@ -504,7 +539,7 @@ export class CoderabbitReviewBroker {
           repo: req.repo,
           pr_number: req.pr_number,
           head_sha: req.expected_head_sha,
-          review_mode: "full",
+          review_mode: req.review_mode,
           dry_run: true,
           would_post: true,
           github_login: this.expectedGithubLogin,
@@ -534,7 +569,7 @@ export class CoderabbitReviewBroker {
           repo: req.repo,
           pr_number: req.pr_number,
           head_sha: req.expected_head_sha,
-          review_mode: "full",
+          review_mode: req.review_mode,
           dry_run: false,
           posted: true,
           idempotent: true,
@@ -554,7 +589,7 @@ export class CoderabbitReviewBroker {
       const created = await this.githubJson<GithubComment>(
         token,
         this.githubPath(req.repo, `/issues/${req.pr_number}/comments`),
-        { method: "POST", body: JSON.stringify({ body: CODERABBIT_FULL_REVIEW_COMMENT }) },
+        { method: "POST", body: JSON.stringify({ body: commentForMode(req.review_mode) }) },
       );
       if (!Number.isSafeInteger(created.id)) {
         const error = new Error("GitHub comment creation response did not contain a valid comment id");
@@ -572,7 +607,14 @@ export class CoderabbitReviewBroker {
       );
       if (
         readback.id !== created.id ||
-        readback.body !== CODERABBIT_FULL_REVIEW_COMMENT ||
+        // ⛔ MUST be the comment for THIS request's mode, not the full-review constant. Hardcoding
+        // it here meant a `review` post would be written to a real PR under the operator's
+        // identity and THEN fail readback as an identity/body mismatch — marked unsafe_posted
+        // after the irreversible write. No test caught it: every test used review_mode "full",
+        // and the fake GitHub returns the full-review body unconditionally, so the assertion and
+        // the fixture agreed with each other and with neither reality nor the new default.
+        // [[a-control-must-not-share-the-probes-failure-mode]]
+        readback.body !== commentForMode(req.review_mode) ||
         readback.user?.login !== this.expectedGithubLogin
       ) {
         const error = new Error("GitHub comment readback identity/body mismatch");
@@ -591,7 +633,7 @@ export class CoderabbitReviewBroker {
         repo: req.repo,
         pr_number: req.pr_number,
         head_sha: req.expected_head_sha,
-        review_mode: "full",
+        review_mode: req.review_mode,
         dry_run: false,
         posted: true,
         idempotent: false,
