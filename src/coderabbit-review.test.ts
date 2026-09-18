@@ -41,6 +41,8 @@ type FakeOptions = {
 
 function fakeGithub(options: FakeOptions = {}) {
   let posted = false;
+  /** the body the broker actually POSTed — echoed back, as GitHub does. */
+  let lastPostedBody = "";
   const calls: Array<{ url: string; method: string; auth: string | null; body?: unknown }> = [];
   let head = options.currentHead ?? HEAD_A;
   const fetchImpl = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
@@ -70,9 +72,15 @@ function fakeGithub(options: FakeOptions = {}) {
     if (url.endsWith("/issues/42/comments") && method === "POST") {
       posted = true;
       if (options.postThrows) throw new Error("simulated ambiguous transport failure");
+      // ⛔ ECHO WHAT WAS POSTED. This used to return CODERABBIT_FULL_REVIEW_COMMENT no matter
+      // what the broker sent, which is not what GitHub does — and it hid a real defect: the
+      // readback check compared against the full-review constant, so any other mode would have
+      // posted to a live PR and then failed readback as unsafe_posted. Fixture and assertion
+      // agreed with each other and with nothing else.
+      lastPostedBody = (body as { body?: string } | undefined)?.body ?? "";
       return Response.json({
         id: 9001,
-        body: CODERABBIT_FULL_REVIEW_COMMENT,
+        body: lastPostedBody,
         html_url: "https://github.com/fabrica-land/fabrica-v3-api/pull/42#issuecomment-9001",
         user: { login: "mividtim" },
       });
@@ -80,7 +88,7 @@ function fakeGithub(options: FakeOptions = {}) {
     if (url.endsWith("/issues/comments/9001")) {
       return Response.json({
         id: 9001,
-        body: options.readbackBody ?? CODERABBIT_FULL_REVIEW_COMMENT,
+        body: options.readbackBody ?? lastPostedBody,
         html_url: "https://github.com/fabrica-land/fabrica-v3-api/pull/42#issuecomment-9001",
         user: { login: options.readbackLogin ?? "mividtim" },
       });
@@ -153,6 +161,63 @@ describe("CoderabbitReviewBroker", () => {
     expect(result.github_login).toBe("mividtim");
     expect(fake.posts()).toHaveLength(1);
     expect(fake.posts()[0]!.body).toEqual({ body: CODERABBIT_FULL_REVIEW_COMMENT });
+    broker.close();
+  });
+
+  // ── WHICH COMMAND GETS POSTED ────────────────────────────────────────────────────────────
+  // ⛔ THE TOOL'S MOST IMPORTANT PROPERTY WAS UNTESTED. Until 2026-09-18 the broker's only mode
+  //   was "full", which posts "@coderabbitai full review" — a whole-PR re-review, the expensive
+  //   command — so every trigger it could express was the costly one, and nothing asserted that
+  //   this was intended. It reached the operator as "IT SHOULD NOT BE POSTING `full review`".
+  // ⇒ These tests pin the posted TEXT per mode, because that is the irreversible effect.
+
+  test("DEFAULT mode posts the incremental review command, not full review", async () => {
+    const { broker, fake } = makeBroker();
+    const req = request({ dry_run: false });
+    delete (req as Partial<CoderabbitReviewRequest>).review_mode;   // omitted => default
+    const result = await broker.request(req, CALLER);
+    expect(result.posted).toBe(true);
+    expect(result.review_mode).toBe("review");
+    expect(fake.posts()).toHaveLength(1);
+    expect(fake.posts()[0]!.body).toEqual({ body: "@coderabbitai review" });
+    // ★ THE CONTROL THAT MATTERS: readback must ACCEPT this body. The check compared against the
+    //   full-review constant, so a review post was written to the PR and then failed readback as
+    //   an identity/body mismatch — flagged unsafe AFTER the irreversible write.
+    expect(result.comment_id).toBe(9001);
+    broker.close();
+  });
+
+  test("explicit full mode still posts the full-review command", async () => {
+    const { broker, fake } = makeBroker();
+    const result = await broker.request(request({ dry_run: false, review_mode: "full" }), CALLER);
+    expect(result.review_mode).toBe("full");
+    expect(fake.posts()[0]!.body).toEqual({ body: CODERABBIT_FULL_REVIEW_COMMENT });
+    expect(result.comment_id).toBe(9001);
+    broker.close();
+  });
+
+  test("the two modes post DIFFERENT text (the assertion is multi-valued)", async () => {
+    // The two requests target DIFFERENT repos: the per-PR minimum interval is keyed on
+    // (repo, pr) and would otherwise refuse the second one for a reason unrelated to modes.
+    const a = makeBroker();
+    const ra = request({ dry_run: false });
+    delete (ra as Partial<CoderabbitReviewRequest>).review_mode;
+    await a.broker.request(ra, CALLER);
+    const b = makeBroker(fakeGithub({ repo: "fabrica-land/soil-app" }));
+    await b.broker.request(
+      request({ dry_run: false, review_mode: "full", repo: "fabrica-land/soil-app" }),
+      CALLER,
+    );
+    expect(a.fake.posts()[0]!.body).not.toEqual(b.fake.posts()[0]!.body);
+    a.broker.close(); b.broker.close();
+  });
+
+  test("an unknown review_mode is REFUSED, never coerced to a default", async () => {
+    const { broker, fake } = makeBroker();
+    await expect(
+      broker.request(request({ dry_run: false, review_mode: "ful" as never }), CALLER),
+    ).rejects.toThrow(/review_mode/);
+    expect(fake.posts()).toHaveLength(0);   // a typo must not post anything at all
     broker.close();
   });
 
