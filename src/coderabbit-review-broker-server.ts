@@ -25,6 +25,7 @@ import {
   GithubCommentCapabilitiesBroker,
   PR_COMMENT_METHOD,
   REVIEW_THREAD_REPLY_METHOD,
+  parseCapabilityCallerPatterns,
   parseCapabilityCallers,
 } from "./github-comment-capabilities.js";
 import { githubTokenSourceFromEnv } from "./github-token-source.js";
@@ -87,6 +88,11 @@ async function main(): Promise<void> {
     allowedRepos,
     allowedCapabilityCallers: parseCapabilityCallers(
       process.env.GITHUB_COMMENT_BROKER_ALLOWED_CALLERS_JSON ?? "{}",
+    ),
+    // Lanes may reply on CodeRabbit's review threads by name pattern (Baguette 628085); the broker
+    // itself refuses a pattern on any other capability and any non-CodeRabbit thread.
+    capabilityCallerPatterns: parseCapabilityCallerPatterns(
+      process.env.GITHUB_COMMENT_BROKER_ALLOWED_CALLER_PATTERNS_JSON,
     ),
     tokenSource,
     stateFile,

@@ -8,6 +8,7 @@ import {
   GithubCommentCapabilitiesBroker,
   PR_COMMENT_METHOD,
   REVIEW_THREAD_REPLY_METHOD,
+  parseCapabilityCallerPatterns,
   parseCapabilityCallers,
   type AuditTextPolicy,
   type CapabilityCallerMap,
@@ -47,6 +48,7 @@ type FakeOptions = {
   anchorCommit?: string;
   anchorPosition?: number | null;
   anchorIsReply?: boolean;
+  anchorLogin?: string;
   anchorDeletedAfterPost?: boolean;
   readbackBody?: string;
   readbackLogin?: string;
@@ -82,7 +84,7 @@ function fakeGithub(options: FakeOptions = {}) {
         id: ANCHOR_ID,
         body: "review finding",
         html_url: `https://github.com/${REPO}/pull/42#discussion_r${ANCHOR_ID}`,
-        user: { login: "coderabbitai[bot]" },
+        user: { login: options.anchorLogin ?? "coderabbitai[bot]" },
         pull_request_url: pullUrl(options.anchorPr ?? 42, options.anchorRepo ?? REPO),
         commit_id: options.anchorCommit ?? HEAD_A,
         position: options.anchorPosition === undefined ? 5 : options.anchorPosition,
@@ -190,6 +192,7 @@ function makeBroker(
   fake = fakeGithub(),
   options: {
     callerGrants?: CapabilityCallerMap;
+    callerPatterns?: string;
     auditTextPolicy?: AuditTextPolicy;
     prInterval?: number;
     replyInterval?: number;
@@ -204,6 +207,7 @@ function makeBroker(
   const broker = new GithubCommentCapabilitiesBroker({
     allowedRepos: new Set([REPO, "fabrica-land/fabrica-v3-api"]),
     allowedCapabilityCallers: options.callerGrants ?? grants(),
+    capabilityCallerPatterns: parseCapabilityCallerPatterns(options.callerPatterns),
     tokenSource: new FineGrainedPatFileTokenSource(tokenFile),
     stateFile,
     auditFile,
@@ -245,6 +249,71 @@ describe("GithubCommentCapabilitiesBroker", () => {
       setup.broker.request(REVIEW_THREAD_REPLY_METHOD, replyRequest(), CALLER),
     ).rejects.toThrow(/not authorized/);
     setup.broker.close();
+  });
+
+  describe("lane pattern grant (review_thread_reply only, CodeRabbit threads only)", () => {
+    const LANE = { source: "eng-4399-fix", sourcePubkey: "ephemeral-lane-key-0001" };
+    const PATTERNS = '{"github.review_thread_reply": "^eng-[a-z0-9-]+$"}';
+
+    test("a pattern-matched lane replies on a CodeRabbit thread and the audit records the grant", async () => {
+      const setup = makeBroker(undefined, { callerPatterns: PATTERNS });
+      await expect(
+        setup.broker.request(REVIEW_THREAD_REPLY_METHOD, replyRequest({ dry_run: false }), LANE),
+      ).resolves.toMatchObject({ posted: true, comment_id: REPLY_ID });
+      expect(setup.fake.posts()).toHaveLength(1);
+      expect(readFileSync(setup.auditFile, "utf8")).toContain('"caller_grant":"pattern"');
+      setup.broker.close();
+    });
+
+    test("a pattern-matched lane is refused on a human-started thread, dry run and live", async () => {
+      const setup = makeBroker(fakeGithub({ anchorLogin: "some-human-reviewer" }), { callerPatterns: PATTERNS });
+      await expect(
+        setup.broker.request(REVIEW_THREAD_REPLY_METHOD, replyRequest(), LANE),
+      ).rejects.toThrow(/only on threads started by coderabbitai\[bot\]/);
+      await expect(
+        setup.broker.request(REVIEW_THREAD_REPLY_METHOD, replyRequest({ dry_run: false }), LANE),
+      ).rejects.toThrow(/only on threads started by coderabbitai\[bot\]/);
+      expect(setup.fake.posts()).toHaveLength(0);
+      setup.broker.close();
+    });
+
+    test("an explicitly granted persona may still reply on a human-started thread", async () => {
+      const setup = makeBroker(fakeGithub({ anchorLogin: "some-human-reviewer" }), { callerPatterns: PATTERNS });
+      await expect(
+        setup.broker.request(REVIEW_THREAD_REPLY_METHOD, replyRequest({ dry_run: false }), CALLER),
+      ).resolves.toMatchObject({ posted: true });
+      setup.broker.close();
+    });
+
+    test("a pattern never grants pr_comment, a non-matching name, or a caller without a verified key", async () => {
+      const setup = makeBroker(undefined, { callerPatterns: PATTERNS });
+      await expect(setup.broker.request(PR_COMMENT_METHOD, prRequest(), LANE)).rejects.toThrow(/not authorized/);
+      await expect(
+        setup.broker.request(REVIEW_THREAD_REPLY_METHOD, replyRequest(), { ...LANE, source: "not-eng-4399" }),
+      ).rejects.toThrow(/not authorized/);
+      await expect(
+        setup.broker.request(REVIEW_THREAD_REPLY_METHOD, replyRequest(), { source: LANE.source }),
+      ).rejects.toThrow(/not authorized/);
+      expect(setup.fake.calls).toHaveLength(0);
+      setup.broker.close();
+    });
+
+    test("parser and constructor refuse a pr_comment pattern and an unanchored pattern", () => {
+      expect(() => parseCapabilityCallerPatterns('{"github.pr_comment": "^eng-[a-z0-9-]+$"}')).toThrow(
+        /cannot be granted by caller pattern/,
+      );
+      expect(() => parseCapabilityCallerPatterns('{"github.review_thread_reply": "eng-"}')).toThrow(/anchored/);
+      expect(() => parseCapabilityCallerPatterns('{"github.review_thread_reply": "^.*$"}')).toThrow(/every caller/);
+      expect(parseCapabilityCallerPatterns(undefined).size).toBe(0);
+      expect(() => new GithubCommentCapabilitiesBroker({
+        allowedRepos: new Set([REPO]),
+        allowedCapabilityCallers: grants(),
+        capabilityCallerPatterns: new Map([[PR_COMMENT_METHOD, [/^eng-[a-z0-9-]+$/]]]),
+        tokenSource: new FineGrainedPatFileTokenSource(join(dir, "unused")),
+        stateFile: join(dir, "s.sqlite"),
+        auditFile: join(dir, "a.jsonl"),
+      })).toThrow(/cannot be granted by caller pattern/);
+    });
   });
 
   test("posts exact arbitrary Unicode, markdown, mentions, and URLs as a PR comment", async () => {
