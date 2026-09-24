@@ -11,7 +11,7 @@ import {
 } from "node:fs";
 import { dirname } from "node:path";
 import type { GithubTokenSource } from "./github-token-source.js";
-import { EXPECTED_GITHUB_LOGIN, type VerifiedCaller } from "./coderabbit-review.js";
+import { EXPECTED_GITHUB_LOGIN, parseAllowedCallerPatterns, type VerifiedCaller } from "./coderabbit-review.js";
 
 export const PR_COMMENT_METHOD = "github.pr_comment";
 export const REVIEW_THREAD_REPLY_METHOD = "github.review_thread_reply";
@@ -63,9 +63,24 @@ export type CapabilityCallerMap = ReadonlyMap<
   ReadonlyMap<string, ReadonlySet<string>>
 >;
 
+export type CapabilityCallerPatternMap = ReadonlyMap<CommentCapability, readonly RegExp[]>;
+
+/**
+ * Ephemeral lanes cannot be enumerated by public key, so a capability may also grant by anchored
+ * NAME PATTERN + verified key (the CodeRabbit-command shape, Tim 2026-09-18).
+ * ⛔ Only github.review_thread_reply may carry patterns, and a pattern grant may reply ONLY on a
+ * thread whose root comment is CodeRabbit's. The broker posts as Tim: Tim's grant is "lanes talk to
+ * CodeRabbit as him", not "lanes talk to human reviewers as him". pr_comment has no anchor to bind.
+ */
+export const PATTERN_GRANTABLE_CAPABILITIES: readonly CommentCapability[] = [REVIEW_THREAD_REPLY_METHOD];
+export const CODERABBIT_BOT_LOGIN = "coderabbitai[bot]";
+
+type CallerGrant = "explicit" | "pattern";
+
 export type GithubCommentCapabilitiesConfig = {
   allowedRepos: ReadonlySet<string>;
   allowedCapabilityCallers: CapabilityCallerMap;
+  capabilityCallerPatterns?: CapabilityCallerPatternMap;
   tokenSource: GithubTokenSource;
   stateFile: string;
   auditFile: string;
@@ -324,6 +339,11 @@ export class GithubCommentCapabilitiesBroker {
         }
       }
     }
+    for (const [capability, patterns] of config.capabilityCallerPatterns ?? new Map()) {
+      if (patterns.length > 0 && !PATTERN_GRANTABLE_CAPABILITIES.includes(capability)) {
+        throw new Error(`capability '${capability}' cannot be granted by caller pattern`);
+      }
+    }
     this.fetchImpl = config.fetchImpl ?? fetch;
     this.now = config.now ?? Date.now;
     this.auditTextPolicy = config.auditTextPolicy ?? "hash";
@@ -378,9 +398,17 @@ export class GithubCommentCapabilitiesBroker {
     this.db.close();
   }
 
-  private isCallerAllowed(capability: CommentCapability, caller: VerifiedCaller): boolean {
+  /** How a caller was authorised, or null. Returned (not just booleaned) so the audit records it. */
+  private callerGrant(capability: CommentCapability, caller: VerifiedCaller): CallerGrant | null {
+    // ⛔ NO VERIFIED KEY => NO GRANT, by either route. Checked first so neither path can skip it.
+    if (!caller.sourcePubkey) return null;
     const keys = this.config.allowedCapabilityCallers.get(capability)?.get(caller.source);
-    return Boolean(caller.sourcePubkey && keys?.has(caller.sourcePubkey));
+    if (keys?.has(caller.sourcePubkey)) return "explicit";
+    if (!PATTERN_GRANTABLE_CAPABILITIES.includes(capability)) return null;
+    for (const re of this.config.capabilityCallerPatterns?.get(capability) ?? []) {
+      if (re.test(caller.source)) return "pattern";
+    }
+    return null;
   }
 
   private audit(event: Record<string, unknown>): void {
@@ -457,6 +485,7 @@ export class GithubCommentCapabilitiesBroker {
   private async validateThreadAnchor(
     token: string,
     request: ReviewThreadReplyRequest,
+    grant: CallerGrant,
   ): Promise<GithubReviewComment> {
     const anchor = await this.githubJson<GithubReviewComment>(
       token,
@@ -468,6 +497,9 @@ export class GithubCommentCapabilitiesBroker {
     }
     if (anchor.in_reply_to_id !== undefined) {
       throw new Error("review_comment_id must identify the root comment of a review thread");
+    }
+    if (grant === "pattern" && anchor.user?.login !== CODERABBIT_BOT_LOGIN) {
+      throw new Error(`pattern-granted callers may reply only on threads started by ${CODERABBIT_BOT_LOGIN}`);
     }
     if (
       anchor.commit_id !== request.expected_head_sha ||
@@ -640,7 +672,8 @@ export class GithubCommentCapabilitiesBroker {
     let reserved = false;
     let postAttempted = false;
     try {
-      if (!this.isCallerAllowed(capability, caller)) {
+      const grant = this.callerGrant(capability, caller);
+      if (!grant) {
         throw new Error(`caller is not authorized for capability '${capability}'`);
       }
       const parsed = parseRequest(capability, input);
@@ -654,6 +687,7 @@ export class GithubCommentCapabilitiesBroker {
         request_id: requestId,
         capability,
         caller: caller.source,
+        caller_grant: grant,
         repo: parsed.repo,
         pr_number: parsed.pr_number,
         head_sha: parsed.expected_head_sha,
@@ -668,7 +702,7 @@ export class GithubCommentCapabilitiesBroker {
         const token = await this.config.tokenSource.getToken();
         await this.validateIdentityAndPr(token, parsed);
         if (capability === REVIEW_THREAD_REPLY_METHOD) {
-          await this.validateThreadAnchor(token, parsed as ReviewThreadReplyRequest);
+          await this.validateThreadAnchor(token, parsed as ReviewThreadReplyRequest, grant);
         }
         const result: GithubCommentCapabilityResult = {
           request_id: requestId,
@@ -719,7 +753,7 @@ export class GithubCommentCapabilitiesBroker {
       await this.validateIdentityAndPr(token, parsed);
       let anchor: GithubReviewComment | undefined;
       if (capability === REVIEW_THREAD_REPLY_METHOD) {
-        anchor = await this.validateThreadAnchor(token, parsed as ReviewThreadReplyRequest);
+        anchor = await this.validateThreadAnchor(token, parsed as ReviewThreadReplyRequest, grant);
       }
 
       postAttempted = true;
@@ -775,7 +809,7 @@ export class GithubCommentCapabilitiesBroker {
           this.markUnsafe(key, reply, error);
           throw error;
         }
-        const finalAnchor = await this.validateThreadAnchor(token, threadRequest);
+        const finalAnchor = await this.validateThreadAnchor(token, threadRequest, grant);
         if (finalAnchor.id !== anchor?.id) {
           const error = new Error("review-thread anchor drifted during publication");
           this.markUnsafe(key, reply, error);
@@ -846,6 +880,23 @@ export function parseCapabilityCallers(value: string): CapabilityCallerMap {
       callers.set(source, new Set(keys as string[]));
     }
     result.set(capability, callers);
+  }
+  return result;
+}
+
+/** Parse `{"github.review_thread_reply": "^eng-[a-z0-9-]+$"}` (comma-separated anchored patterns). */
+export function parseCapabilityCallerPatterns(value: string | undefined): CapabilityCallerPatternMap {
+  const raw = JSON.parse(value?.trim() || "{}") as Record<string, unknown>;
+  const result = new Map<CommentCapability, readonly RegExp[]>();
+  for (const [key, patterns] of Object.entries(raw)) {
+    if (!COMMENT_CAPABILITIES.includes(key as CommentCapability)) {
+      throw new Error(`unsupported comment capability '${key}'`);
+    }
+    if (!PATTERN_GRANTABLE_CAPABILITIES.includes(key as CommentCapability)) {
+      throw new Error(`capability '${key}' cannot be granted by caller pattern`);
+    }
+    if (typeof patterns !== "string") throw new Error(`capability '${key}' patterns must be a string`);
+    result.set(key as CommentCapability, parseAllowedCallerPatterns(patterns));
   }
   return result;
 }
