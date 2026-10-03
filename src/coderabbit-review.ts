@@ -200,10 +200,12 @@ type StoredRequest = {
   comment_id: number | null;
   comment_url: string | null;
   requested_at: number;
+  posted_at: number | null;
 };
 
 type ReservationDecision =
   | { kind: "reserved"; key: string }
+  | { kind: "would_post"; key: string }
   | { kind: "idempotent"; key: string; previous: StoredRequest };
 
 function ensurePrivateParent(path: string): void {
@@ -459,7 +461,7 @@ export class CoderabbitReviewBroker {
   private stored(key: string): StoredRequest | null {
     return this.db
       .query<StoredRequest, [string]>(
-        "SELECT status, comment_id, comment_url, requested_at FROM review_requests WHERE request_key = ?",
+        "SELECT status, comment_id, comment_url, requested_at, posted_at FROM review_requests WHERE request_key = ?",
       )
       .get(key) ?? null;
   }
@@ -511,12 +513,22 @@ export class CoderabbitReviewBroker {
     req: CoderabbitReviewRequest,
     caller: string,
     now: number,
-    intervalWaived = false,
+    previousRefused = false,
+    reserve = true,
   ): ReservationDecision {
     const key = requestKey(req);
     const transaction = this.db.transaction(() => {
       const existing = this.stored(key);
-      if (existing?.status === "posted") {
+      // 2026-10-03 (Baguette 656618, Brioche 656625): CodeRabbit answered this exact request's
+      // post with "Review rate limited" and reviewed nothing. Returning it as idempotent made
+      // the only retry a no-op that echoed the refused comment. A refused post is NOT a posted
+      // review: when it is the PR's latest post, the identical request posts again.
+      const retryRefused =
+        existing?.status === "posted" &&
+        previousRefused &&
+        existing.posted_at !== null &&
+        existing.posted_at === this.latestPostedAt(req.repo, req.pr_number);
+      if (existing?.status === "posted" && !retryRefused) {
         return { kind: "idempotent", key, previous: existing } as const;
       }
       if (existing?.status === "unsafe_posted" || existing?.status === "processing") {
@@ -539,11 +551,13 @@ export class CoderabbitReviewBroker {
       }
 
       const postedAt = this.latestPostedAt(req.repo, req.pr_number);
-      if (!intervalWaived && postedAt !== null && now - postedAt < this.minimumIntervalMs) {
+      if (!previousRefused && postedAt !== null && now - postedAt < this.minimumIntervalMs) {
         throw new Error("review request is rate-limited for this PR");
       }
+      // dry_run: the same decision, no write — a preview must not promise a post the real call refuses
+      if (!reserve) return { kind: "would_post", key } as const;
 
-      if (existing && existing.status !== "failed") {
+      if (existing && existing.status !== "failed" && !retryRefused) {
         throw new Error(`stored review request has unsupported state '${existing.status}'`);
       }
       if (existing) {
@@ -552,9 +566,9 @@ export class CoderabbitReviewBroker {
             `UPDATE review_requests SET
                caller = ?, status = 'processing', requested_at = ?, posted_at = NULL,
                comment_id = NULL, comment_url = NULL, error = NULL
-             WHERE request_key = ? AND status = 'failed'`,
+             WHERE request_key = ? AND status = ?`,
           )
-          .run(caller, now, key);
+          .run(caller, now, key, existing.status);
         if (update.changes !== 1) throw new Error("failed request reservation lost an atomic race");
       } else {
         this.db
@@ -621,6 +635,8 @@ export class CoderabbitReviewBroker {
       if (req.dry_run) {
         const token = await this.config.tokenSource.getToken();
         await this.validateIdentityAndPr(token, req);
+        const refused = await this.lastTriggerRefusal(token, req.repo, req.pr_number);
+        const preview = this.decideAndReserve(req, caller.source, this.now(), Boolean(refused), false);
         const result: ReviewBrokerResult = {
           request_id: requestId,
           repo: req.repo,
@@ -628,7 +644,11 @@ export class CoderabbitReviewBroker {
           head_sha: req.expected_head_sha,
           review_mode: req.review_mode,
           dry_run: true,
-          would_post: true,
+          would_post: preview.kind === "would_post",
+          ...(preview.kind === "idempotent"
+            ? { idempotent: true, comment_id: preview.previous.comment_id ?? undefined, comment_url: preview.previous.comment_url ?? undefined }
+            : {}),
+          ...(refused ? { previous_trigger_refused: true, ...(refused.reset_minutes !== null ? { coderabbit_reset_minutes: refused.reset_minutes } : {}) } : {}),
           github_login: this.expectedGithubLogin,
         };
         this.audit({ event: "result", caller: caller.source, outcome: "dry_run", ...result });
@@ -650,6 +670,7 @@ export class CoderabbitReviewBroker {
       }
       const decision = this.decideAndReserve(req, caller.source, this.now(), Boolean(refusal));
       key = decision.key;
+      if (decision.kind === "would_post") throw new Error("internal: reservation returned a preview");
       if (decision.kind === "idempotent") {
         const result: ReviewBrokerResult = {
           request_id: requestId,

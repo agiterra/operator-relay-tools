@@ -397,6 +397,82 @@ describe("CoderabbitReviewBroker", () => {
     expect(fake.posts()).toHaveLength(1);
   });
 
+  // 2026-10-03 (Baguette 656618 / Brioche 656625): the identical retry after a refusal returned the
+  // refused comment as idempotent, and the dry run before it said would_post true.
+  const REFUSAL = (atMs: number) => ({ id: 5971245829, body: "Review rate limited. Next included review in 4 minutes.", login: "coderabbitai[bot]", created_at: new Date(atMs).toISOString() });
+
+  test("an IDENTICAL request (same head, mode, no key) posts again when CodeRabbit refused its post", async () => {
+    const fake = fakeGithub({ comments: [REFUSAL(1_700_000_007_000)] });
+    const setup = makeBroker(fake, undefined, 30 * 60_000);
+    expect((await setup.broker.request(request({ dry_run: false }), CALLER)).posted).toBe(true);
+    setup.advance(60_000);
+    const retry = await setup.broker.request(request({ dry_run: false }), CALLER);
+    expect(retry.posted).toBe(true);
+    expect(retry.idempotent).toBe(false);
+    expect(retry.previous_trigger_refused).toBe(true);
+    expect(fake.posts()).toHaveLength(2);
+    // the refusal is older than the retry's post: the retry stands, the next identical call is idempotent
+    setup.advance(60_000);
+    const third = await setup.broker.request(request({ dry_run: false }), CALLER);
+    expect(third.idempotent).toBe(true);
+    expect(fake.posts()).toHaveLength(2);
+  });
+
+  test("dry_run reports the decision the real call makes: idempotent -> would_post false", async () => {
+    const { broker, fake } = makeBroker();
+    await broker.request(request({ dry_run: false }), CALLER);
+    const preview = await broker.request(request({ dry_run: true }), CALLER);
+    expect(preview.would_post).toBe(false);
+    expect(preview.idempotent).toBe(true);
+    expect(preview.comment_id).toBe(9001);
+    const real = await broker.request(request({ dry_run: false }), CALLER);
+    expect(real.idempotent).toBe(true);
+    expect(fake.posts()).toHaveLength(1);
+    broker.close();
+  });
+
+  test("dry_run after a refused post -> would_post true and says why; it writes nothing", async () => {
+    const fake = fakeGithub({ comments: [REFUSAL(1_700_000_007_000)] });
+    const setup = makeBroker(fake, undefined, 30 * 60_000);
+    await setup.broker.request(request({ dry_run: false }), CALLER);
+    setup.advance(60_000);
+    const preview = await setup.broker.request(request({ dry_run: true }), CALLER);
+    expect(preview.would_post).toBe(true);
+    expect(preview.previous_trigger_refused).toBe(true);
+    expect(preview.coderabbit_reset_minutes).toBe(4);
+    expect(fake.posts()).toHaveLength(1);
+    // the preview reserved nothing: the real call still posts
+    expect((await setup.broker.request(request({ dry_run: false }), CALLER)).posted).toBe(true);
+    expect(fake.posts()).toHaveLength(2);
+  });
+
+  test("dry_run inside the per-PR interval refuses as the real call does", async () => {
+    const setup = makeBroker(undefined, undefined, 30 * 60_000);
+    await setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-4601-real-0001" }), CALLER);
+    setup.advance(60_000);
+    await expect(
+      setup.broker.request(request({ dry_run: true, client_idempotency_key: "brioche-4601-real-0002" }), CALLER),
+    ).rejects.toThrow(/rate-limited/);
+  });
+
+  test("a refusal of the PR's NEWER post does not re-open an OLDER posted request", async () => {
+    // post A at t0, post B (fresh key) at t0+2min, CodeRabbit refuses B at t0+2min+5s
+    const fake = fakeGithub({ comments: [REFUSAL(1_700_000_125_000)] });
+    const setup = makeBroker(fake, undefined, 60_000);
+    await setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-4601-real-000A" }), CALLER);
+    setup.advance(120_000);
+    await setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-4601-real-000B" }), CALLER);
+    setup.advance(60_000);
+    const oldA = await setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-4601-real-000A" }), CALLER);
+    expect(oldA.idempotent).toBe(true);
+    expect(fake.posts()).toHaveLength(2);
+    // ... while B, the refused one, does post again
+    const retryB = await setup.broker.request(request({ dry_run: false, client_idempotency_key: "brioche-4601-real-000B" }), CALLER);
+    expect(retryB.posted).toBe(true);
+    expect(retryB.idempotent).toBe(false);
+    expect(fake.posts()).toHaveLength(3);
+  });
+
   test("serializes concurrent identical requests into one post", async () => {
     const { broker, fake } = makeBroker();
     const results = await Promise.allSettled([
